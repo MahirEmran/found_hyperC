@@ -806,15 +806,18 @@ static int header_save_binaries(Header *h, const char *out_dir) {
     char path[MAX_PATH_LEN];
     header_build_bitstreams(h);
 
-    snprintf(path, sizeof(path), "%s/header.bin", out_dir);
+    if (build_out_path(out_dir, "header.bin", path, sizeof(path)) != 0) return -1;
     if (bw_write_to_file(&h->header_bitstream, path) != 0) return -1;
 
-    snprintf(path, sizeof(path), "%s/optional_tables.bin", out_dir);
+    if (build_out_path(out_dir, "optional_tables.bin", path, sizeof(path)) != 0) return -1;
     if (bw_write_to_file(&h->optional_tables_bitstream, path) != 0) return -1;
 
     BitWriter err_bw;
     header_get_error_limits_bitstream(h, &err_bw);
-    snprintf(path, sizeof(path), "%s/error_limits.bin", out_dir);
+    if (build_out_path(out_dir, "error_limits.bin", path, sizeof(path)) != 0) {
+        bw_free(&err_bw);
+        return -1;
+    }
     if (bw_write_to_file(&err_bw, path) != 0) {
         bw_free(&err_bw);
         return -1;
@@ -2214,6 +2217,15 @@ static int make_output_folder(const char *output_root, const char *raw_path, int
     return ensure_dir(out_dir);
 }
 
+static int build_out_path(const char *out_dir, const char *file_name, char *path, size_t path_len) {
+    int written = snprintf(path, path_len, "%s/%s", out_dir, file_name);
+    if (written < 0 || (size_t)written >= path_len) {
+        fprintf(stderr, "Output path too long: %s/%s\n", out_dir, file_name);
+        return -1;
+    }
+    return 0;
+}
+
 static int write_hybrid_initial_accu(const char *out_dir, HybridEncoder *enc, int z, int dyn_bits, int initial_count_exponent) {
     BitWriter bw; bw_init(&bw);
     int bits = dyn_bits + initial_count_exponent;
@@ -2225,7 +2237,10 @@ static int write_hybrid_initial_accu(const char *out_dir, HybridEncoder *enc, in
     bw_pad_to_byte(&bw);
 
     char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/hybrid_initial_accumulator.bin", out_dir);
+    if (build_out_path(out_dir, "hybrid_initial_accumulator.bin", path, sizeof(path)) != 0) {
+        bw_free(&bw);
+        return -1;
+    }
     int rc = bw_write_to_file(&bw, path);
     bw_free(&bw);
     return rc;
@@ -2249,7 +2264,10 @@ static int write_bitstream_with_header(const char *out_dir, Header *h, BitWriter
     for (int i = 0; i < fill; i++) bw_append_bit(&full, 0);
 
     char path[MAX_PATH_LEN];
-    snprintf(path, sizeof(path), "%s/z-output-bitstream.bin", out_dir);
+    if (build_out_path(out_dir, "z-output-bitstream.bin", path, sizeof(path)) != 0) {
+        bw_free(&full);
+        return -1;
+    }
     int rc = bw_write_to_file(&full, path);
     bw_free(&full);
     return rc;
@@ -2318,7 +2336,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
     const char *dump_mqi = getenv("CCSDS123_DUMP_MQI");
     if (dump_mqi && dump_mqi[0] != '\0') {
         char path[MAX_PATH_LEN];
-        snprintf(path, sizeof(path), "%s/mqi_dump.bin", out_dir);
+        if (build_out_path(out_dir, "mqi_dump.bin", path, sizeof(path)) != 0) goto cleanup;
         FILE *f = fopen(path, "wb");
         if (f) {
             size_t count = (size_t)header_get_x_size(&h) * (size_t)header_get_y_size(&h) * (size_t)header_get_z_size(&h);
@@ -2361,7 +2379,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
         }
         /* Empty hybrid accumulator for non-hybrid coder */
         char path[MAX_PATH_LEN];
-        snprintf(path, sizeof(path), "%s/hybrid_initial_accumulator.bin", out_dir);
+        if (build_out_path(out_dir, "hybrid_initial_accumulator.bin", path, sizeof(path)) != 0) goto cleanup;
         FILE *f = fopen(path, "wb");
         if (f) fclose(f);
     } else {
@@ -2376,7 +2394,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
             goto cleanup;
         }
         char path[MAX_PATH_LEN];
-        snprintf(path, sizeof(path), "%s/hybrid_initial_accumulator.bin", out_dir);
+        if (build_out_path(out_dir, "hybrid_initial_accumulator.bin", path, sizeof(path)) != 0) goto cleanup;
         FILE *f = fopen(path, "wb");
         if (f) fclose(f);
     }
@@ -2466,7 +2484,11 @@ int main(int argc, char **argv) {
     build_output_folder_path(output_dir, input_file, ael, out_dir);
 
     char bitstream_path[MAX_PATH_LEN];
-    snprintf(bitstream_path, sizeof(bitstream_path), "%s/z-output-bitstream.bin", out_dir);
+    if (build_out_path(out_dir, "z-output-bitstream.bin", bitstream_path, sizeof(bitstream_path)) != 0) {
+        fprintf(stderr, "Warning: could not compute compression factor.\n");
+        printf("Done compressing.\n");
+        return 0;
+    }
 
     long long in_size = 0, out_size = 0;
     if (get_file_size(input_file, &in_size) == 0 && get_file_size(bitstream_path, &out_size) == 0 && out_size > 0) {
