@@ -50,7 +50,7 @@ int main(int argc, char **argv) {
 
     if (ccsds123_ensure_dir(output_dir) != 0) return 1;
 
-    printf("[ccsds123_native] %s (AEL=%d)\n", input_file, ael);
+    printf("[ccsds123.0-b-2] %s (AEL=%d)\n", input_file, ael);
     if (ccsds123_compress_one_image(input_file, output_dir, ael, override_x, override_y, override_z, override_dtype) != 0) {
         fprintf(stderr, "Failed: %s\n", input_file);
         return 1;

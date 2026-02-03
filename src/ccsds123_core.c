@@ -1444,6 +1444,21 @@ typedef struct {
     BitWriter bitstream;
 } SampleAdaptiveEncoder;
 
+static void sa_free(SampleAdaptiveEncoder *enc) {
+    if (!enc) return;
+    free(enc->accumulator_init_parameter_1);
+    enc->accumulator_init_parameter_1 = NULL;
+    free(enc->accumulator_init_parameter_2);
+    enc->accumulator_init_parameter_2 = NULL;
+    free(enc->accumulator);
+    enc->accumulator = NULL;
+    free(enc->counter);
+    enc->counter = NULL;
+    free(enc->variable_length_code);
+    enc->variable_length_code = NULL;
+    bw_free(&enc->bitstream);
+}
+
 static void sa_init(SampleAdaptiveEncoder *enc, Header *h, ImageConstants *ic, int64_t *mqi) {
     memset(enc, 0, sizeof(*enc));
     enc->header = h;
@@ -1650,6 +1665,15 @@ typedef struct {
 
     BitWriter bitstream;
 } HybridEncoder;
+
+static void hyb_free(HybridEncoder *enc) {
+    if (!enc) return;
+    free(enc->accumulator);
+    enc->accumulator = NULL;
+    free(enc->counter);
+    enc->counter = NULL;
+    bw_free(&enc->bitstream);
+}
 
 static void hyb_init(HybridEncoder *enc, Header *h, ImageConstants *ic, int64_t *mqi) {
     memset(enc, 0, sizeof(*enc));
@@ -1931,6 +1955,15 @@ typedef struct {
 
     BitWriter bitstream;
 } BlockAdaptiveEncoder;
+
+static void ba_free(BlockAdaptiveEncoder *enc) {
+    if (!enc) return;
+    free(enc->blocks);
+    enc->blocks = NULL;
+    free(enc->zero_block_count);
+    enc->zero_block_count = NULL;
+    bw_free(&enc->bitstream);
+}
 
 static void ba_init(BlockAdaptiveEncoder *enc, Header *h, ImageConstants *ic, int64_t *mqi) {
     memset(enc, 0, sizeof(*enc));
@@ -2358,25 +2391,31 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
         hyb_init(&enc, &h, &ic, pred.mapped_quantizer_index);
         if (hyb_run(&enc) != 0) {
             fprintf(stderr, "Hybrid encoder failed for %s\n", raw_path);
+            hyb_free(&enc);
             goto cleanup;
         }
         if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
             fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
+            hyb_free(&enc);
             goto cleanup;
         }
         if (write_hybrid_initial_accu(out_dir, &enc, z, ic.dynamic_range_bits, enc.initial_count_exponent) != 0) {
             fprintf(stderr, "Failed writing hybrid accumulator for %s\n", raw_path);
+            hyb_free(&enc);
             goto cleanup;
         }
+        hyb_free(&enc);
     } else if (h.entropy_coder_type == ENTROPY_SA) {
         SampleAdaptiveEncoder enc;
         sa_init(&enc, &h, &ic, pred.mapped_quantizer_index);
         if (sa_run(&enc) != 0) {
             fprintf(stderr, "Sample-adaptive encoder failed for %s\n", raw_path);
+            sa_free(&enc);
             goto cleanup;
         }
         if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
             fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
+            sa_free(&enc);
             goto cleanup;
         }
         /* Empty hybrid accumulator for non-hybrid coder */
@@ -2384,21 +2423,25 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
         if (build_out_path(out_dir, "hybrid_initial_accumulator.bin", path, sizeof(path)) != 0) goto cleanup;
         FILE *f = fopen(path, "wb");
         if (f) fclose(f);
+        sa_free(&enc);
     } else {
         BlockAdaptiveEncoder enc;
         ba_init(&enc, &h, &ic, pred.mapped_quantizer_index);
         if (ba_run(&enc) != 0) {
             fprintf(stderr, "Block-adaptive encoder failed for %s\n", raw_path);
+            ba_free(&enc);
             goto cleanup;
         }
         if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
             fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
+            ba_free(&enc);
             goto cleanup;
         }
         char path[MAX_PATH_LEN];
         if (build_out_path(out_dir, "hybrid_initial_accumulator.bin", path, sizeof(path)) != 0) goto cleanup;
         FILE *f = fopen(path, "wb");
         if (f) fclose(f);
+        ba_free(&enc);
     }
 
     result = 0;
