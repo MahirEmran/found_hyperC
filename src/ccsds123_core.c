@@ -48,6 +48,8 @@
 #define build_output_folder_path ccsds123_build_output_folder_path
 #define get_file_size ccsds123_get_file_size
 
+static int build_out_path(const char *out_dir, const char *file_name, char *path, size_t path_len);
+
 /* ---------------- Header and enums ---------------- */
 
 typedef enum { SAMPLE_UNSIGNED = 0, SAMPLE_SIGNED = 1 } SampleType;
