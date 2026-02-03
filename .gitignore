@@ -9,3 +9,5 @@ data/temp/**
 .vscode
 .VSCodeCounter
 doc/**
+**.raw
+output/

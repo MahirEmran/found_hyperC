@@ -19,6 +19,8 @@
 #define MAX_TABLE_ENTRIES 257
 #define MAX_TABLE_STR 512
 
+#include "hybrid_tables_data.h"
+
 #define clip_i64 ccsds123_clip_i64
 #define sign_i64 ccsds123_sign_i64
 #define sign_positive_i64 ccsds123_sign_positive_i64
@@ -176,83 +178,10 @@ typedef struct {
 static const int input_symbol_limit[16] = {12,10,8,6,6,4,4,4,2,2,2,2,2,2,2,0};
 static const int threshold_table[16] = {303336,225404,166979,128672,95597,69670,50678,34898,23331,14935,9282,5510,3195,1928,1112,408};
 
-static char *code_table_input[16][MAX_TABLE_ENTRIES];
-static char *code_table_output[16][MAX_TABLE_ENTRIES];
-static char *flush_table_prefix[16][MAX_TABLE_ENTRIES];
-static char *flush_table_word[16][MAX_TABLE_ENTRIES];
-
-static void free_tables(void) {
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < MAX_TABLE_ENTRIES; j++) {
-            free(code_table_input[i][j]);
-            free(code_table_output[i][j]);
-            free(flush_table_prefix[i][j]);
-            free(flush_table_word[i][j]);
-            code_table_input[i][j] = NULL;
-            code_table_output[i][j] = NULL;
-            flush_table_prefix[i][j] = NULL;
-            flush_table_word[i][j] = NULL;
-        }
-    }
-}
-
-static char *strdup_safe(const char *s) {
-    size_t n = strlen(s);
-    char *out = (char *)malloc(n + 1);
-    if (!out) return NULL;
-    memcpy(out, s, n + 1);
-    return out;
-}
-
-static void trim(char *s) {
-    char *start = s;
-    while (*start && isspace((unsigned char)*start)) start++;
-    if (start != s) {
-        memmove(s, start, strlen(start) + 1);
-    }
-    char *end = s + strlen(s);
-    while (end > s && isspace((unsigned char)end[-1])) {
-        end[-1] = '\0';
-        end--;
-    }
-}
-
-static int load_table_file(const char *path, char *out_a[MAX_TABLE_ENTRIES], char *out_b[MAX_TABLE_ENTRIES]) {
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-
-    char line[1024];
-    int count = 0;
-    while (fgets(line, sizeof(line), f)) {
-        char *comma = strchr(line, ',');
-        if (!comma) continue;
-        *comma = '\0';
-        char *a = line;
-        char *b = comma + 1;
-        trim(a);
-        trim(b);
-        if (count < MAX_TABLE_ENTRIES) {
-            out_a[count] = strdup_safe(a);
-            out_b[count] = strdup_safe(b);
-            count++;
-        }
-    }
-    fclose(f);
-    return 0;
-}
-
-static int tables_init(const char *base_dir) {
-    char path[MAX_PATH_LEN];
-    for (int i = 0; i < 16; i++) {
-        snprintf(path, sizeof(path), "%s/code_%02d.txt", base_dir, i);
-        if (load_table_file(path, code_table_input[i], code_table_output[i]) != 0) return -1;
-    }
-    for (int i = 0; i < 16; i++) {
-        snprintf(path, sizeof(path), "%s/flush_%02d.txt", base_dir, i);
-        if (load_table_file(path, flush_table_prefix[i], flush_table_word[i]) != 0) return -1;
-    }
-    return 0;
-}
+#define code_table_input hybrid_code_table_input
+#define code_table_output hybrid_code_table_output
+#define flush_table_prefix hybrid_flush_table_prefix
+#define flush_table_word hybrid_flush_table_word
 
 /* -------------- Header helpers -------------- */
 
@@ -356,6 +285,41 @@ static void header_init_defaults(Header *h) {
 
     bw_init(&h->header_bitstream);
     bw_init(&h->optional_tables_bitstream);
+}
+
+static void header_free(Header *h) {
+    if (!h) return;
+    free(h->weight_init_table);
+    h->weight_init_table = NULL;
+    free(h->weight_exponent_offset_table);
+    h->weight_exponent_offset_table = NULL;
+
+    free(h->absolute_error_limit_table);
+    h->absolute_error_limit_table = NULL;
+    free(h->periodic_absolute_error_limit_table);
+    h->periodic_absolute_error_limit_table = NULL;
+    free(h->relative_error_limit_table);
+    h->relative_error_limit_table = NULL;
+    free(h->periodic_relative_error_limit_table);
+    h->periodic_relative_error_limit_table = NULL;
+
+    free(h->damping_table_array);
+    h->damping_table_array = NULL;
+    free(h->damping_offset_table_array);
+    h->damping_offset_table_array = NULL;
+    free(h->accumulator_init_table);
+    h->accumulator_init_table = NULL;
+
+    if (h->supp_tables) {
+        for (int i = 0; i < h->supplementary_information_table_count; i++) {
+            bw_free(&h->supp_tables[i].table_data_subblock);
+        }
+        free(h->supp_tables);
+        h->supp_tables = NULL;
+    }
+
+    bw_free(&h->header_bitstream);
+    bw_free(&h->optional_tables_bitstream);
 }
 
 static void header_init_weight_init_table(Header *h) {
@@ -901,6 +865,54 @@ typedef struct {
     int64_t *mapped_quantizer_index; /* [y][x][z] */
 } Predictor;
 
+static void predictor_free(Predictor *p) {
+    if (!p) return;
+    free(p->spectral_bands_used);
+    p->spectral_bands_used = NULL;
+    free(p->weight_update_scaling_exponent);
+    p->weight_update_scaling_exponent = NULL;
+    free(p->weight_exponent_offset);
+    p->weight_exponent_offset = NULL;
+
+    free(p->absolute_error_limits);
+    p->absolute_error_limits = NULL;
+    free(p->relative_error_limits);
+    p->relative_error_limits = NULL;
+
+    free(p->local_sum);
+    p->local_sum = NULL;
+    free(p->local_difference_vector);
+    p->local_difference_vector = NULL;
+    free(p->weight_vector);
+    p->weight_vector = NULL;
+    free(p->predicted_central_local_difference);
+    p->predicted_central_local_difference = NULL;
+    free(p->high_resolution_predicted_sample_value);
+    p->high_resolution_predicted_sample_value = NULL;
+    free(p->double_resolution_predicted_sample_value);
+    p->double_resolution_predicted_sample_value = NULL;
+    free(p->predicted_sample_value);
+    p->predicted_sample_value = NULL;
+    free(p->prediction_residual);
+    p->prediction_residual = NULL;
+    free(p->maximum_error);
+    p->maximum_error = NULL;
+    free(p->quantizer_index);
+    p->quantizer_index = NULL;
+    free(p->clipped_quantizer_bin_center);
+    p->clipped_quantizer_bin_center = NULL;
+    free(p->double_resolution_sample_representative);
+    p->double_resolution_sample_representative = NULL;
+    free(p->sample_representative);
+    p->sample_representative = NULL;
+    free(p->double_resolution_prediction_error);
+    p->double_resolution_prediction_error = NULL;
+    free(p->scaled_prediction_endpoint_difference);
+    p->scaled_prediction_endpoint_difference = NULL;
+    free(p->mapped_quantizer_index);
+    p->mapped_quantizer_index = NULL;
+}
+
 static void predictor_init(Predictor *p, Header *h, ImageConstants *ic, int64_t *image_sample) {
     memset(p, 0, sizeof(*p));
     p->header = h;
@@ -1369,8 +1381,14 @@ static void predictor_calculate_mapped_quantizer_index(Predictor *p, int x, int 
 }
 
 static int predictor_run(Predictor *p) {
-    if (predictor_init_constants(p) != 0) return -1;
-    if (predictor_init_arrays(p) != 0) return -1;
+    if (predictor_init_constants(p) != 0) {
+        predictor_free(p);
+        return -1;
+    }
+    if (predictor_init_arrays(p) != 0) {
+        predictor_free(p);
+        return -1;
+    }
 
     Header *h = p->header;
     int x = header_get_x_size(h);
@@ -2237,16 +2255,14 @@ static int write_bitstream_with_header(const char *out_dir, Header *h, BitWriter
     return rc;
 }
 
-static const char *select_hybrid_tables_dir(void) {
-    const char *env = getenv("CCSDS123_HYBRID_TABLES");
-    if (env && env[0] != '\0') return env;
-    return NULL;
-}
-
 static int compress_one_image(const char *raw_path, const char *output_root, int ael,
                               int override_x, int override_y, int override_z, const char *override_dtype) {
     Header h;
     header_init_defaults(&h);
+    int result = -1;
+    int64_t *image_sample = NULL;
+    Predictor pred;
+    int pred_ready = 0;
     char dtype[16] = {0};
     int z = 0, y = 0, x = 0;
     int parsed = (parse_raw_filename(raw_path, dtype, &z, &y, &x) == 0);
@@ -2264,7 +2280,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
             /* parsed x/y already set above */
         } else {
             fprintf(stderr, "Need --x/--y (filename has no dimensions): %s\n", raw_path);
-            return -1;
+            goto cleanup;
         }
     }
     if (z <= 0) z = 1;
@@ -2273,7 +2289,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
         dtype[sizeof(dtype) - 1] = '\0';
     }
 
-    if (header_config_from_dims(&h, x, y, z, dtype) != 0) return -1;
+    if (header_config_from_dims(&h, x, y, z, dtype) != 0) goto cleanup;
 
     /* apply AEL override */
     h.quantizer_fidelity_control_method = QF_ABS;
@@ -2282,24 +2298,22 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
     header_init_tables_default(&h);
 
     char out_dir[MAX_PATH_LEN];
-    if (make_output_folder(output_root, raw_path, ael, out_dir) != 0) return -1;
+    if (make_output_folder(output_root, raw_path, ael, out_dir) != 0) goto cleanup;
 
     /* load image */
     /* dtype/x/y/z already resolved above */
 
-    int64_t *image_sample = NULL;
-    if (load_raw_bip(raw_path, dtype, z, y, x, &image_sample) != 0) return -1;
+    if (load_raw_bip(raw_path, dtype, z, y, x, &image_sample) != 0) goto cleanup;
 
     ImageConstants ic;
     image_constants_init(&ic, &h);
 
-    Predictor pred;
     predictor_init(&pred, &h, &ic, image_sample);
     if (predictor_run(&pred) != 0) {
         fprintf(stderr, "Predictor failed for %s\n", raw_path);
-        free(image_sample);
-        return -1;
+        goto cleanup;
     }
+    pred_ready = 1;
 
     const char *dump_mqi = getenv("CCSDS123_DUMP_MQI");
     if (dump_mqi && dump_mqi[0] != '\0') {
@@ -2316,74 +2330,34 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
     int rc = header_save_binaries(&h, out_dir);
     if (rc != 0) {
         fprintf(stderr, "Failed to write header binaries for %s\n", raw_path);
-        free(image_sample);
-        return -1;
+        goto cleanup;
     }
 
     if (h.entropy_coder_type == ENTROPY_HYBRID) {
-        const char *tables_dir = select_hybrid_tables_dir();
-        if (tables_dir) {
-            if (tables_init(tables_dir) != 0) {
-                fprintf(stderr, "Failed to load hybrid tables from %s\n", tables_dir);
-                free(image_sample);
-                return -1;
-            }
-        } else {
-            const char *candidates[] = {
-                "hybrid_encoder_tables",
-                "./hybrid_encoder_tables",
-                "../hybrid_encoder_tables",
-                "ccsds123_i2_hlm/hybrid_encoder_tables"
-            };
-            int loaded = 0;
-            for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-                if (tables_init(candidates[i]) == 0) {
-                    tables_dir = candidates[i];
-                    loaded = 1;
-                    break;
-                }
-            }
-            if (!loaded) {
-                fprintf(stderr, "Failed to load hybrid tables. Set CCSDS123_HYBRID_TABLES or place hybrid_encoder_tables near the executable.\n");
-                free(image_sample);
-                return -1;
-            }
-        }
-
         HybridEncoder enc;
         hyb_init(&enc, &h, &ic, pred.mapped_quantizer_index);
         if (hyb_run(&enc) != 0) {
             fprintf(stderr, "Hybrid encoder failed for %s\n", raw_path);
-            free_tables();
-            free(image_sample);
-            return -1;
+            goto cleanup;
         }
         if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
             fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
-            free_tables();
-            free(image_sample);
-            return -1;
+            goto cleanup;
         }
         if (write_hybrid_initial_accu(out_dir, &enc, z, ic.dynamic_range_bits, enc.initial_count_exponent) != 0) {
             fprintf(stderr, "Failed writing hybrid accumulator for %s\n", raw_path);
-            free_tables();
-            free(image_sample);
-            return -1;
+            goto cleanup;
         }
-
-        free_tables();
     } else if (h.entropy_coder_type == ENTROPY_SA) {
         SampleAdaptiveEncoder enc;
         sa_init(&enc, &h, &ic, pred.mapped_quantizer_index);
         if (sa_run(&enc) != 0) {
             fprintf(stderr, "Sample-adaptive encoder failed for %s\n", raw_path);
-            free(image_sample);
-            return -1;
+            goto cleanup;
         }
         if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
             fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
-            free(image_sample);
-            return -1;
+            goto cleanup;
         }
         /* Empty hybrid accumulator for non-hybrid coder */
         char path[MAX_PATH_LEN];
@@ -2395,13 +2369,11 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
         ba_init(&enc, &h, &ic, pred.mapped_quantizer_index);
         if (ba_run(&enc) != 0) {
             fprintf(stderr, "Block-adaptive encoder failed for %s\n", raw_path);
-            free(image_sample);
-            return -1;
+            goto cleanup;
         }
         if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
             fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
-            free(image_sample);
-            return -1;
+            goto cleanup;
         }
         char path[MAX_PATH_LEN];
         snprintf(path, sizeof(path), "%s/hybrid_initial_accumulator.bin", out_dir);
@@ -2409,8 +2381,13 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
         if (f) fclose(f);
     }
 
+    result = 0;
+
+cleanup:
+    if (pred_ready) predictor_free(&pred);
     free(image_sample);
-    return 0;
+    header_free(&h);
+    return result;
 }
 
 static int ends_with_raw(const char *name) {
@@ -2479,7 +2456,7 @@ int main(int argc, char **argv) {
 
     if (ensure_dir(output_dir) != 0) return 1;
 
-    printf("[ccsds123_native] %s (AEL=%d)\n", input_file, ael);
+    printf("[ccsds123.0-b-2] %s (AEL=%d)\n", input_file, ael);
     if (compress_one_image(input_file, output_dir, ael, override_x, override_y, override_z, override_dtype) != 0) {
         fprintf(stderr, "Failed: %s\n", input_file);
         return 1;
@@ -2499,7 +2476,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Warning: could not compute compression factor.\n");
     }
 
-    printf("Done.\n");
+    printf("Done compressing.\n");
     return 0;
 }
 #endif

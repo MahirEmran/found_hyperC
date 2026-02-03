@@ -114,14 +114,9 @@ int ccsds123_load_raw_bip(const char *path, const char *dtype, int z, int y, int
 }
 
 void ccsds123_build_output_folder_path(const char *output_root, const char *raw_path, int ael, char *out_dir) {
-    const char *base = strrchr(raw_path, '/');
-    base = base ? base + 1 : raw_path;
-    char stem[CCSDS123_MAX_PATH_LEN];
-    strncpy(stem, base, sizeof(stem) - 1);
-    stem[sizeof(stem) - 1] = '\0';
-    char *dot = strrchr(stem, '.');
-    if (dot) *dot = '\0';
-    snprintf(out_dir, CCSDS123_MAX_PATH_LEN, "%s/%s_ael%d", output_root, stem, ael);
+    (void)raw_path;
+    (void)ael;
+    snprintf(out_dir, CCSDS123_MAX_PATH_LEN, "%s", output_root);
 }
 
 int ccsds123_get_file_size(const char *path, long long *out_size) {

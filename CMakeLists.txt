@@ -21,16 +21,6 @@ add_executable(hc-compress
 )
 target_link_libraries(hc-compress PRIVATE hc-compress-lib)
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hybrid_encoder_tables")
-    add_custom_command(TARGET hc-compress POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${CMAKE_CURRENT_SOURCE_DIR}/hybrid_encoder_tables"
-                "$<TARGET_FILE_DIR:hc-compress>/hybrid_encoder_tables"
-    )
-    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/hybrid_encoder_tables"
-            DESTINATION .)
-endif()
-
 find_library(MATH_LIBRARY m)
 if(MATH_LIBRARY)
     target_link_libraries(hc-compress-lib PUBLIC ${MATH_LIBRARY})
