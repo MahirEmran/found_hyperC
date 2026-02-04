@@ -3,9 +3,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
-#include <dirent.h>
-#include <errno.h>
-#include <ctype.h>
 
 #include "ccsds123_utils.h"
 #include "ccsds123_io.h"
@@ -16,14 +13,6 @@
  */
 
 #define MAX_PATH_LEN CCSDS123_MAX_PATH_LEN
-#define MAX_TABLE_ENTRIES 257
-#define MAX_TABLE_STR 512
-
-#include "hybrid_tables_data.h"
-#define code_table_input hybrid_code_table_input
-#define code_table_output hybrid_code_table_output
-#define flush_table_prefix hybrid_flush_table_prefix
-#define flush_table_word hybrid_flush_table_word
 
 #define clip_i64 ccsds123_clip_i64
 #define sign_i64 ccsds123_sign_i64
@@ -59,10 +48,8 @@ static int build_out_path(const char *out_dir, const char *file_name, char *path
 typedef enum { SAMPLE_UNSIGNED = 0, SAMPLE_SIGNED = 1 } SampleType;
 typedef enum { LARGE_D_SMALL = 0, LARGE_D_LARGE = 1 } LargeDFlag;
 typedef enum { ORDER_BI = 0, ORDER_BSQ = 1 } SampleEncodingOrder;
-typedef enum { ENTROPY_SA = 0, ENTROPY_HYBRID = 1, ENTROPY_BA = 2 } EntropyCoderType;
+typedef enum { ENTROPY_BA = 2 } EntropyCoderType;
 typedef enum { QF_LOSSLESS = 0, QF_ABS = 1, QF_REL = 2, QF_ABS_REL = 3 } QuantizerFidelityControlMethod;
-typedef enum { TABLE_UNSIGNED = 0, TABLE_SIGNED = 1, TABLE_FLOAT = 2 } TableType;
-typedef enum { TSTRUCT_0D = 0, TSTRUCT_1D = 1, TSTRUCT_2D_ZX = 2, TSTRUCT_2D_YX = 3 } TableStructure;
 typedef enum { SR_NOT_INCLUDED = 0, SR_INCLUDED = 1 } SampleRepresentativeFlag;
 typedef enum { PRED_FULL = 0, PRED_REDUCED = 1 } PredictionMode;
 typedef enum { WEO_ALL_ZERO = 0, WEO_NOT_ALL_ZERO = 1 } WeightExponentOffsetFlag;
@@ -80,14 +67,6 @@ typedef enum { ACCU_INIT_TABLE_NOT_INCLUDED = 0, ACCU_INIT_TABLE_INCLUDED = 1 } 
 typedef enum { RESTRICTED_UNRESTRICTED = 0, RESTRICTED_RESTRICTED = 1 } RestrictedCodeOptionsFlag;
 
 typedef struct {
-    TableType table_type;
-    int table_purpose;
-    TableStructure table_structure;
-    int user_defined_data;
-    BitWriter table_data_subblock; /* stored as bitstream */
-} SupplementaryInformationTable;
-
-typedef struct {
     /* Image metadata */
     int user_defined_data;
     int x_size;
@@ -101,8 +80,6 @@ typedef struct {
     int output_word_size;
     EntropyCoderType entropy_coder_type;
     QuantizerFidelityControlMethod quantizer_fidelity_control_method;
-    int supplementary_information_table_count;
-    SupplementaryInformationTable *supp_tables;
 
     /* Predictor metadata */
     SampleRepresentativeFlag sample_representative_flag;
@@ -179,11 +156,6 @@ typedef struct {
     int64_t middle_sample_value;
 } ImageConstants;
 
-/* ---------------- Hybrid Tables ---------------- */
-
-static const int input_symbol_limit[16] = {12,10,8,6,6,4,4,4,2,2,2,2,2,2,2,0};
-static const int threshold_table[16] = {303336,225404,166979,128672,95597,69670,50678,34898,23331,14935,9282,5510,3195,1928,1112,408};
-
 /* -------------- Header helpers -------------- */
 
 static int header_get_x_size(const Header *h) { return (h->x_size == 0) ? 65536 : h->x_size; }
@@ -223,10 +195,8 @@ static void header_init_defaults(Header *h) {
     h->sample_encoding_order = ORDER_BI;
     h->sub_frame_interleaving_depth = 1;
     h->output_word_size = 0;
-    h->entropy_coder_type = ENTROPY_HYBRID;
+    h->entropy_coder_type = ENTROPY_BA;
     h->quantizer_fidelity_control_method = QF_ABS_REL;
-    h->supplementary_information_table_count = 0;
-    h->supp_tables = NULL;
 
     h->sample_representative_flag = SR_INCLUDED;
     h->prediction_bands_num = 3;
@@ -310,14 +280,6 @@ static void header_free(Header *h) {
     h->damping_offset_table_array = NULL;
     free(h->accumulator_init_table);
     h->accumulator_init_table = NULL;
-
-    if (h->supp_tables) {
-        for (int i = 0; i < h->supplementary_information_table_count; i++) {
-            bw_free(&h->supp_tables[i].table_data_subblock);
-        }
-        free(h->supp_tables);
-        h->supp_tables = NULL;
-    }
 
     bw_free(&h->header_bitstream);
     bw_free(&h->optional_tables_bitstream);
@@ -553,7 +515,7 @@ static void header_encode_essential(const Header *h, BitWriter *bw) {
     bw_append_bits_u64(bw, 0, 1);
     bw_append_bits_u64(bw, (uint64_t)h->quantizer_fidelity_control_method, 2);
     bw_append_bits_u64(bw, 0, 2);
-    bw_append_bits_u64(bw, (uint64_t)h->supplementary_information_table_count, 4);
+    bw_append_bits_u64(bw, 0, 4);
 }
 
 static void header_encode_predictor_primary(const Header *h, BitWriter *header_bw, BitWriter *optional_bw) {
@@ -707,38 +669,11 @@ static void header_encode_sample_representative(const Header *h, BitWriter *head
 }
 
 static void header_encode_entropy(const Header *h, BitWriter *header_bw, BitWriter *optional_bw) {
-    if (h->entropy_coder_type == ENTROPY_SA) {
-        bw_append_bits_u64(header_bw, (uint64_t)h->unary_length_limit, 5);
-        bw_append_bits_u64(header_bw, (uint64_t)h->rescaling_counter_size, 3);
-        bw_append_bits_u64(header_bw, (uint64_t)h->initial_count_exponent, 3);
-        bw_append_bits_u64(header_bw, (uint64_t)h->accumulator_init_constant, 4);
-        bw_append_bits_u64(header_bw, (uint64_t)h->accumulator_init_table_flag, 1);
-
-        if (h->accumulator_init_constant == 15) {
-            BitWriter temp; bw_init(&temp);
-            int z = header_get_z_size(h);
-            for (int i = 0; i < z; i++) {
-                bw_append_bits_u64(&temp, (uint64_t)h->accumulator_init_table[i], 4);
-            }
-            bw_pad_to_byte(&temp);
-            if (h->accumulator_init_table_flag == ACCU_INIT_TABLE_INCLUDED) {
-                bw_append_from_bw(header_bw, &temp);
-            } else {
-                bw_append_from_bw(optional_bw, &temp);
-            }
-            bw_free(&temp);
-        }
-    } else if (h->entropy_coder_type == ENTROPY_HYBRID) {
-        bw_append_bits_u64(header_bw, (uint64_t)h->unary_length_limit, 5);
-        bw_append_bits_u64(header_bw, (uint64_t)h->rescaling_counter_size, 3);
-        bw_append_bits_u64(header_bw, (uint64_t)h->initial_count_exponent, 3);
-        bw_append_bits_u64(header_bw, 0, 5);
-    } else {
-        bw_append_bits_u64(header_bw, 0, 1);
-        bw_append_bits_u64(header_bw, (uint64_t)h->block_size, 2);
-        bw_append_bits_u64(header_bw, (uint64_t)h->restricted_code_options_flag, 1);
-        bw_append_bits_u64(header_bw, (uint64_t)h->reference_sample_interval, 12);
-    }
+    (void)optional_bw;
+    bw_append_bits_u64(header_bw, 0, 1);
+    bw_append_bits_u64(header_bw, (uint64_t)h->block_size, 2);
+    bw_append_bits_u64(header_bw, (uint64_t)h->restricted_code_options_flag, 1);
+    bw_append_bits_u64(header_bw, (uint64_t)h->reference_sample_interval, 12);
 }
 
 static void header_build_bitstreams(Header *h) {
@@ -1368,521 +1303,6 @@ static int predictor_run(Predictor *p) {
 
 /* ---------------- Encoders ---------------- */
 
-/* Sample-Adaptive Encoder */
-
-typedef struct {
-    Header *header;
-    ImageConstants *image_constants;
-    int64_t *mapped_quantizer_index;
-
-    int unary_length_limit;
-    int rescaling_counter_size;
-    int initial_count_exponent;
-
-    int64_t *accumulator_init_parameter_1;
-    int64_t *accumulator_init_parameter_2;
-
-    int64_t *accumulator; /* [y][x][z] */
-    int64_t *counter; /* [y][x] */
-    int64_t *variable_length_code; /* [y][x][z] */
-
-    BitWriter bitstream;
-} SampleAdaptiveEncoder;
-
-static void sa_free(SampleAdaptiveEncoder *enc) {
-    if (!enc) return;
-    free(enc->accumulator_init_parameter_1);
-    enc->accumulator_init_parameter_1 = NULL;
-    free(enc->accumulator_init_parameter_2);
-    enc->accumulator_init_parameter_2 = NULL;
-    free(enc->accumulator);
-    enc->accumulator = NULL;
-    free(enc->counter);
-    enc->counter = NULL;
-    free(enc->variable_length_code);
-    enc->variable_length_code = NULL;
-    bw_free(&enc->bitstream);
-}
-
-static void sa_init(SampleAdaptiveEncoder *enc, Header *h, ImageConstants *ic, int64_t *mqi) {
-    memset(enc, 0, sizeof(*enc));
-    enc->header = h;
-    enc->image_constants = ic;
-    enc->mapped_quantizer_index = mqi;
-    bw_init(&enc->bitstream);
-}
-
-static int sa_init_constants(SampleAdaptiveEncoder *enc) {
-    Header *h = enc->header;
-    enc->unary_length_limit = h->unary_length_limit + 32 * (h->unary_length_limit == 0);
-    enc->rescaling_counter_size = h->rescaling_counter_size + 4;
-    enc->initial_count_exponent = h->initial_count_exponent + 8 * (h->initial_count_exponent == 0);
-
-    int z = header_get_z_size(h);
-    enc->accumulator_init_parameter_2 = alloc_i64((size_t)z);
-    enc->accumulator_init_parameter_1 = alloc_i64((size_t)z);
-    if (!enc->accumulator_init_parameter_1 || !enc->accumulator_init_parameter_2) return -1;
-
-    for (int i = 0; i < z; i++) {
-        enc->accumulator_init_parameter_2[i] = h->accumulator_init_table[i];
-        if (enc->accumulator_init_parameter_2[i] <= 30 - enc->image_constants->dynamic_range_bits) {
-            enc->accumulator_init_parameter_1[i] = enc->accumulator_init_parameter_2[i];
-        } else {
-            enc->accumulator_init_parameter_1[i] = 2 * enc->accumulator_init_parameter_2[i] +
-                enc->image_constants->dynamic_range_bits - 30;
-        }
-    }
-    return 0;
-}
-
-static int sa_init_arrays(SampleAdaptiveEncoder *enc) {
-    Header *h = enc->header;
-    int x = header_get_x_size(h);
-    int y = header_get_y_size(h);
-    int z = header_get_z_size(h);
-
-    size_t n3 = (size_t)x * (size_t)y * (size_t)z;
-    size_t n2 = (size_t)x * (size_t)y;
-
-    enc->accumulator = alloc_i64(n3);
-    enc->counter = alloc_i64(n2);
-    enc->variable_length_code = alloc_i64(n3);
-    if (!enc->accumulator || !enc->counter || !enc->variable_length_code) return -1;
-
-    if (y > 1 || x > 1) {
-        int x_t1 = (x == 1) ? 0 : 1;
-        int y_t1 = (x == 1) ? 1 : 0;
-        enc->counter[y_t1 * x + x_t1] = (int64_t)1 << enc->initial_count_exponent;
-        enc->accumulator[idx3(y_t1, x_t1, 0, x, z)] =
-            (int64_t)floor((3 * ((int64_t)1 << (enc->accumulator_init_parameter_1[0] + 6)) - 49) *
-                enc->counter[y_t1 * x + x_t1] / (double)(1 << 7));
-    }
-
-    return 0;
-}
-
-static void sa_find_code_length(SampleAdaptiveEncoder *enc, int x, int y, int z) {
-    Header *h = enc->header;
-    int x_size = header_get_x_size(h);
-    int z_size = header_get_z_size(h);
-    size_t idx = idx3(y, x, z, x_size, z_size);
-
-    int64_t counter = enc->counter[y * x_size + x];
-    int64_t acc = enc->accumulator[idx];
-
-    if (2 * counter > acc + counter * 49 / (1 << 7)) {
-        enc->variable_length_code[idx] = 0;
-    } else {
-        int64_t v_int = (acc + counter * 49 / (1 << 7)) / counter;
-        double v = log2((double)v_int);
-        int64_t k = (int64_t)fmin(v, enc->image_constants->dynamic_range_bits - 2);
-        enc->variable_length_code[idx] = k;
-    }
-}
-
-static void sa_gpo2(BitWriter *bw, int64_t j, int64_t k, int dyn_bits, int unary_limit) {
-    int64_t zeros = (k == 0) ? j : (j >> k);
-    if (zeros < unary_limit) {
-        for (int64_t i = 0; i < zeros; i++) bw_append_bit(bw, 0);
-        bw_append_bit(bw, 1);
-        if (k > 0) {
-            bw_append_bits_u64(bw, (uint64_t)j & ((1ULL << k) - 1), (int)k);
-        }
-    } else {
-        for (int i = 0; i < unary_limit; i++) bw_append_bit(bw, 0);
-        bw_append_bits_u64(bw, (uint64_t)j, dyn_bits);
-    }
-}
-
-static void sa_encode_error_limits(SampleAdaptiveEncoder *enc, int y) {
-    Header *h = enc->header;
-    int z = header_get_z_size(h);
-    int period_index = y / (1 << h->error_update_period_exponent);
-
-    if (h->quantizer_fidelity_control_method != QF_REL) {
-        int bit_depth = header_get_absolute_error_limit_bit_depth_value(h);
-        if (h->absolute_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
-            bw_append_bits_u64(&enc->bitstream, (uint64_t)h->periodic_absolute_error_limit_table[period_index * z], bit_depth);
-        } else {
-            for (int zi = 0; zi < z; zi++) {
-                bw_append_bits_u64(&enc->bitstream, (uint64_t)h->periodic_absolute_error_limit_table[period_index * z + zi], bit_depth);
-            }
-        }
-    }
-
-    if (h->quantizer_fidelity_control_method != QF_ABS) {
-        int bit_depth = header_get_relative_error_limit_bit_depth_value(h);
-        if (h->relative_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
-            bw_append_bits_u64(&enc->bitstream, (uint64_t)h->periodic_relative_error_limit_table[period_index * z], bit_depth);
-        } else {
-            for (int zi = 0; zi < z; zi++) {
-                bw_append_bits_u64(&enc->bitstream, (uint64_t)h->periodic_relative_error_limit_table[period_index * z + zi], bit_depth);
-            }
-        }
-    }
-}
-
-static void sa_encode_sample(SampleAdaptiveEncoder *enc, int x, int y, int z) {
-    Header *h = enc->header;
-    int x_size = header_get_x_size(h);
-    int z_size = header_get_z_size(h);
-    size_t idx = idx3(y, x, z, x_size, z_size);
-
-    if (y == 0 && x == 0) {
-        bw_append_bits_u64(&enc->bitstream, (uint64_t)enc->mapped_quantizer_index[idx], enc->image_constants->dynamic_range_bits);
-        return;
-    }
-
-    int prev_y = y;
-    int prev_x = x - 1;
-    if (prev_x < 0) {
-        prev_y -= 1;
-        prev_x = x_size - 1;
-    }
-    int t = y * x_size + x;
-
-    if (t == 1) {
-        /* no op */
-    } else if (enc->counter[prev_y * x_size + prev_x] == ((int64_t)1 << enc->rescaling_counter_size) - 1) {
-        enc->counter[y * x_size + x] = (enc->counter[prev_y * x_size + prev_x] + 1) / 2;
-        enc->accumulator[idx] = (enc->accumulator[idx3(prev_y, prev_x, z, x_size, z_size)] + enc->mapped_quantizer_index[idx3(prev_y, prev_x, z, x_size, z_size)] + 1) / 2;
-    } else {
-        enc->counter[y * x_size + x] = enc->counter[prev_y * x_size + prev_x] + 1;
-        enc->accumulator[idx] = enc->accumulator[idx3(prev_y, prev_x, z, x_size, z_size)] + enc->mapped_quantizer_index[idx3(prev_y, prev_x, z, x_size, z_size)];
-    }
-
-    sa_find_code_length(enc, x, y, z);
-    sa_gpo2(&enc->bitstream, enc->mapped_quantizer_index[idx], enc->variable_length_code[idx], enc->image_constants->dynamic_range_bits, enc->unary_length_limit);
-}
-
-static int sa_run(SampleAdaptiveEncoder *enc) {
-    if (sa_init_constants(enc) != 0) return -1;
-    if (sa_init_arrays(enc) != 0) return -1;
-
-    Header *h = enc->header;
-    int x = header_get_x_size(h);
-    int y = header_get_y_size(h);
-    int z = header_get_z_size(h);
-
-    if (h->sample_encoding_order == ORDER_BI) {
-        for (int yi = 0; yi < y; yi++) {
-            if (h->periodic_error_updating_flag == PEU_USED &&
-                (yi % (1 << h->error_update_period_exponent) == 0)) {
-                sa_encode_error_limits(enc, yi);
-            }
-            for (int i = 0; i < (z + h->sub_frame_interleaving_depth - 1) / h->sub_frame_interleaving_depth; i++) {
-                for (int xi = 0; xi < x; xi++) {
-                    int z_start = i * h->sub_frame_interleaving_depth;
-                    int z_end = z_start + h->sub_frame_interleaving_depth;
-                    if (z_end > z) z_end = z;
-                    for (int zi = z_start; zi < z_end; zi++) {
-                        sa_encode_sample(enc, xi, yi, zi);
-                    }
-                }
-            }
-        }
-    } else {
-        for (int zi = 0; zi < z; zi++) {
-            for (int yi = 0; yi < y; yi++) {
-                for (int xi = 0; xi < x; xi++) {
-                    sa_encode_sample(enc, xi, yi, zi);
-                }
-            }
-        }
-    }
-
-    return 0;
-}
-
-/* Hybrid encoder */
-
-typedef struct {
-    Header *header;
-    ImageConstants *image_constants;
-    int64_t *mapped_quantizer_index;
-
-    int unary_length_limit;
-    int rescaling_counter_size;
-    int initial_count_exponent;
-
-    int64_t *accumulator; /* [y][x][z] */
-    int64_t *counter; /* [y][x] */
-
-    BitWriter bitstream;
-} HybridEncoder;
-
-static void hyb_free(HybridEncoder *enc) {
-    if (!enc) return;
-    free(enc->accumulator);
-    enc->accumulator = NULL;
-    free(enc->counter);
-    enc->counter = NULL;
-    bw_free(&enc->bitstream);
-}
-
-static void hyb_init(HybridEncoder *enc, Header *h, ImageConstants *ic, int64_t *mqi) {
-    memset(enc, 0, sizeof(*enc));
-    enc->header = h;
-    enc->image_constants = ic;
-    enc->mapped_quantizer_index = mqi;
-    bw_init(&enc->bitstream);
-}
-
-static int hyb_init_constants(HybridEncoder *enc) {
-    Header *h = enc->header;
-    enc->unary_length_limit = h->unary_length_limit + 32 * (h->unary_length_limit == 0);
-    enc->rescaling_counter_size = h->rescaling_counter_size + 4;
-    enc->initial_count_exponent = h->initial_count_exponent + 8 * (h->initial_count_exponent == 0);
-    return 0;
-}
-
-static int hyb_init_arrays(HybridEncoder *enc) {
-    Header *h = enc->header;
-    int x = header_get_x_size(h);
-    int y = header_get_y_size(h);
-    int z = header_get_z_size(h);
-
-    size_t n3 = (size_t)x * (size_t)y * (size_t)z;
-    size_t n2 = (size_t)x * (size_t)y;
-
-    enc->accumulator = alloc_i64(n3);
-    enc->counter = alloc_i64(n2);
-    if (!enc->accumulator || !enc->counter) return -1;
-
-    enc->counter[0] = (int64_t)1 << enc->initial_count_exponent;
-    for (int zi = 0; zi < z; zi++) {
-        enc->accumulator[idx3(0, 0, zi, x, z)] = 4 * enc->counter[0];
-    }
-    return 0;
-}
-
-static void hyb_append_codeword(BitWriter *bw, const char *codeword) {
-    /* codeword like 8'h29 */
-    const char *hpos = strstr(codeword, "'h");
-    if (!hpos) return;
-    int width = atoi(codeword);
-    const char *hex = hpos + 2;
-    char binbuf[1024];
-    binbuf[0] = '\0';
-
-    char temp[8];
-    for (const char *p = hex; *p; p++) {
-        char c = *p;
-        int v = 0;
-        if (c >= '0' && c <= '9') v = c - '0';
-        else if (c >= 'a' && c <= 'f') v = 10 + (c - 'a');
-        else if (c >= 'A' && c <= 'F') v = 10 + (c - 'A');
-        else continue;
-        for (int i = 3; i >= 0; i--) {
-            temp[3 - i] = ((v >> i) & 1) ? '1' : '0';
-        }
-        temp[4] = '\0';
-        strncat(binbuf, temp, sizeof(binbuf) - strlen(binbuf) - 1);
-    }
-
-    int binlen = (int)strlen(binbuf);
-    if (binlen < width) {
-        int pad = width - binlen;
-        for (int i = 0; i < pad; i++) bw_append_bit(bw, 0);
-        bw_append_bits_str(bw, binbuf);
-    } else {
-        const char *start = binbuf + (binlen - width);
-        bw_append_bits_str(bw, start);
-    }
-}
-
-static void hyb_reverse_gpo2(BitWriter *bw, int64_t j, int64_t k, int dyn_bits, int unary_limit) {
-    int64_t zeros = (k == 0) ? j : (j >> k);
-    if (zeros < unary_limit) {
-        if (k == 0) {
-            bw_append_bit(bw, 1);
-            for (int64_t i = 0; i < zeros; i++) bw_append_bit(bw, 0);
-        } else {
-            bw_append_bits_u64(bw, (uint64_t)j & ((1ULL << k) - 1), (int)k);
-            bw_append_bit(bw, 1);
-            for (int64_t i = 0; i < zeros; i++) bw_append_bit(bw, 0);
-        }
-    } else {
-        bw_append_bits_u64(bw, (uint64_t)j, dyn_bits);
-        for (int i = 0; i < unary_limit; i++) bw_append_bit(bw, 0);
-    }
-}
-
-static void hyb_encode_error_limits(HybridEncoder *enc, int y) {
-    Header *h = enc->header;
-    int z = header_get_z_size(h);
-    int period_index = y / (1 << h->error_update_period_exponent);
-
-    if (h->quantizer_fidelity_control_method != QF_REL) {
-        int bit_depth = header_get_absolute_error_limit_bit_depth_value(h);
-        if (h->absolute_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
-            bw_append_bits_u64(&enc->bitstream, (uint64_t)h->periodic_absolute_error_limit_table[period_index * z], bit_depth);
-        } else {
-            for (int zi = 0; zi < z; zi++) {
-                bw_append_bits_u64(&enc->bitstream, (uint64_t)h->periodic_absolute_error_limit_table[period_index * z + zi], bit_depth);
-            }
-        }
-    }
-
-    if (h->quantizer_fidelity_control_method != QF_ABS) {
-        int bit_depth = header_get_relative_error_limit_bit_depth_value(h);
-        if (h->relative_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
-            bw_append_bits_u64(&enc->bitstream, (uint64_t)h->periodic_relative_error_limit_table[period_index * z], bit_depth);
-        } else {
-            for (int zi = 0; zi < z; zi++) {
-                bw_append_bits_u64(&enc->bitstream, (uint64_t)h->periodic_relative_error_limit_table[period_index * z + zi], bit_depth);
-            }
-        }
-    }
-}
-
-static void hyb_encode_sample(HybridEncoder *enc, int x, int y, int z, char active_prefix[16][MAX_TABLE_STR]) {
-    Header *h = enc->header;
-    int x_size = header_get_x_size(h);
-    int z_size = header_get_z_size(h);
-    size_t idx = idx3(y, x, z, x_size, z_size);
-
-    if (y == 0 && x == 0) {
-        bw_append_bits_u64(&enc->bitstream, (uint64_t)enc->mapped_quantizer_index[idx], enc->image_constants->dynamic_range_bits);
-        return;
-    }
-
-    int prev_y = y;
-    int prev_x = x - 1;
-    if (prev_x < 0) {
-        prev_y -= 1;
-        prev_x = x_size - 1;
-    }
-
-    if (enc->counter[prev_y * x_size + prev_x] == ((int64_t)1 << enc->rescaling_counter_size) - 1) {
-        enc->counter[y * x_size + x] = (enc->counter[prev_y * x_size + prev_x] + 1) / 2;
-        enc->accumulator[idx] = (enc->accumulator[idx3(prev_y, prev_x, z, x_size, z_size)] + 4 * enc->mapped_quantizer_index[idx] + 1) / 2;
-        int lsb = (int)(enc->accumulator[idx3(prev_y, prev_x, z, x_size, z_size)] & 1);
-        bw_append_bit(&enc->bitstream, lsb);
-    } else {
-        enc->counter[y * x_size + x] = enc->counter[prev_y * x_size + prev_x] + 1;
-        enc->accumulator[idx] = enc->accumulator[idx3(prev_y, prev_x, z, x_size, z_size)] + 4 * enc->mapped_quantizer_index[idx];
-    }
-
-    if (enc->accumulator[idx] * (1 << 14) >= (int64_t)threshold_table[0] * enc->counter[y * x_size + x]) {
-        int64_t v_int = (enc->accumulator[idx] + enc->counter[y * x_size + x] * 49 / (1 << 5)) / enc->counter[y * x_size + x];
-        int64_t k = (int64_t)fmin(
-            log2((double)v_int) - 2,
-            fmax(enc->image_constants->dynamic_range_bits - 2, 2)
-        );
-        if (k < 2) k = 2;
-        hyb_reverse_gpo2(&enc->bitstream, enc->mapped_quantizer_index[idx], k, enc->image_constants->dynamic_range_bits, enc->unary_length_limit);
-    } else {
-        int code_index = -2;
-        for (int i = 15; i >= 0; i--) {
-            if (enc->accumulator[idx] * (1 << 14) < (int64_t)enc->counter[y * x_size + x] * threshold_table[i]) {
-                code_index = i;
-                break;
-            }
-        }
-        char input_symbol = 'F';
-        if (enc->mapped_quantizer_index[idx] <= input_symbol_limit[code_index]) {
-            int val = (int)enc->mapped_quantizer_index[idx];
-            input_symbol = (val < 10) ? ('0' + val) : ('A' + (val - 10));
-        } else {
-            input_symbol = 'X';
-            int64_t residual = enc->mapped_quantizer_index[idx] - input_symbol_limit[code_index] - 1;
-            hyb_reverse_gpo2(&enc->bitstream, residual, 0, enc->image_constants->dynamic_range_bits, enc->unary_length_limit);
-        }
-
-        size_t len = strlen(active_prefix[code_index]);
-        if (len + 1 < MAX_TABLE_STR) {
-            active_prefix[code_index][len] = input_symbol;
-            active_prefix[code_index][len + 1] = '\0';
-        }
-
-        for (int i = 0; i < MAX_TABLE_ENTRIES && code_table_input[code_index][i]; i++) {
-            if (strcmp(code_table_input[code_index][i], active_prefix[code_index]) == 0) {
-                hyb_append_codeword(&enc->bitstream, code_table_output[code_index][i]);
-                active_prefix[code_index][0] = '\0';
-                break;
-            }
-        }
-    }
-}
-
-static void hyb_encode_image_tail(HybridEncoder *enc, char active_prefix[16][MAX_TABLE_STR]) {
-    Header *h = enc->header;
-    int z = header_get_z_size(h);
-
-    for (int i = 0; i < 16; i++) {
-        int matched = 0;
-        for (int j = 0; j < MAX_TABLE_ENTRIES && flush_table_prefix[i][j]; j++) {
-            if (strcmp(flush_table_prefix[i][j], active_prefix[i]) == 0) {
-                hyb_append_codeword(&enc->bitstream, flush_table_word[i][j]);
-                matched = 1;
-                break;
-            }
-        }
-        if (!matched) {
-            /* if empty prefix, first entry is used */
-            if (flush_table_word[i][0]) hyb_append_codeword(&enc->bitstream, flush_table_word[i][0]);
-        }
-    }
-
-    int x = header_get_x_size(h);
-    int y = header_get_y_size(h);
-    for (int zi = 0; zi < z; zi++) {
-        int64_t acc = enc->accumulator[idx3(y - 1, x - 1, zi, x, z)];
-        int bits = 2 + enc->image_constants->dynamic_range_bits + enc->rescaling_counter_size;
-        bw_append_bits_u64(&enc->bitstream, (uint64_t)acc, bits);
-    }
-    bw_append_bit(&enc->bitstream, 1);
-}
-
-static int hyb_run(HybridEncoder *enc) {
-#if defined(HYBRID_TABLES_EXTERNAL)
-    if (hyb_load_tables_once() != 0) return -1;
-#endif
-    if (hyb_init_constants(enc) != 0) return -1;
-    if (hyb_init_arrays(enc) != 0) return -1;
-
-    Header *h = enc->header;
-    int x = header_get_x_size(h);
-    int y = header_get_y_size(h);
-    int z = header_get_z_size(h);
-
-    char active_prefix[16][MAX_TABLE_STR];
-    for (int i = 0; i < 16; i++) active_prefix[i][0] = '\0';
-
-    if (h->sample_encoding_order == ORDER_BI) {
-        for (int yi = 0; yi < y; yi++) {
-            if (h->periodic_error_updating_flag == PEU_USED &&
-                (yi % (1 << h->error_update_period_exponent) == 0)) {
-                hyb_encode_error_limits(enc, yi);
-            }
-            for (int i = 0; i < (z + h->sub_frame_interleaving_depth - 1) / h->sub_frame_interleaving_depth; i++) {
-                for (int xi = 0; xi < x; xi++) {
-                    int z_start = i * h->sub_frame_interleaving_depth;
-                    int z_end = z_start + h->sub_frame_interleaving_depth;
-                    if (z_end > z) z_end = z;
-                    for (int zi = z_start; zi < z_end; zi++) {
-                        hyb_encode_sample(enc, xi, yi, zi, active_prefix);
-                    }
-                }
-            }
-        }
-    } else {
-        for (int zi = 0; zi < z; zi++) {
-            for (int yi = 0; yi < y; yi++) {
-                for (int xi = 0; xi < x; xi++) {
-                    hyb_encode_sample(enc, xi, yi, zi, active_prefix);
-                }
-            }
-        }
-    }
-
-    hyb_encode_image_tail(enc, active_prefix);
-    return 0;
-}
-
-/* Block-adaptive encoder omitted in this minimal native port (not used in default config). */
-
 /* Block-adaptive encoder */
 
 typedef struct {
@@ -2297,35 +1717,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
     }
     pred_ready = 1;
 
-    if (h.entropy_coder_type == ENTROPY_HYBRID) {
-        HybridEncoder enc;
-        hyb_init(&enc, &h, &ic, pred.mapped_quantizer_index);
-        if (hyb_run(&enc) != 0) {
-            fprintf(stderr, "Hybrid encoder failed for %s\n", raw_path);
-            hyb_free(&enc);
-            goto cleanup;
-        }
-        if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
-            fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
-            hyb_free(&enc);
-            goto cleanup;
-        }
-        hyb_free(&enc);
-    } else if (h.entropy_coder_type == ENTROPY_SA) {
-        SampleAdaptiveEncoder enc;
-        sa_init(&enc, &h, &ic, pred.mapped_quantizer_index);
-        if (sa_run(&enc) != 0) {
-            fprintf(stderr, "Sample-adaptive encoder failed for %s\n", raw_path);
-            sa_free(&enc);
-            goto cleanup;
-        }
-        if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
-            fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
-            sa_free(&enc);
-            goto cleanup;
-        }
-        sa_free(&enc);
-    } else {
+    {
         BlockAdaptiveEncoder enc;
         ba_init(&enc, &h, &ic, pred.mapped_quantizer_index);
         if (ba_run(&enc) != 0) {
