@@ -4,6 +4,15 @@
 
 #include "ccsds123_internal.h"
 
+static int build_out_path(const char *out_dir, const char *file_name, char *path, size_t path_len) {
+    int written = snprintf(path, path_len, "%s/%s", out_dir, file_name);
+    if (written < 0 || (size_t)written >= path_len) {
+        fprintf(stderr, "Output path too long: %s/%s\n", out_dir, file_name);
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <input_raw_file> <output_dir> [ael] [--x N --y N --z N --dtype STR]\n", argv[0]);
@@ -60,7 +69,11 @@ int main(int argc, char **argv) {
     ccsds123_build_output_folder_path(output_dir, input_file, ael, out_dir);
 
     char bitstream_path[CCSDS123_MAX_PATH_LEN];
-    snprintf(bitstream_path, sizeof(bitstream_path), "%s/z-output-bitstream.bin", out_dir);
+    if (build_out_path(out_dir, "z-output-bitstream.bin", bitstream_path, sizeof(bitstream_path)) != 0) {
+        fprintf(stderr, "Warning: could not compute compression factor.\n");
+        printf("Done.\n");
+        return 0;
+    }
 
     long long in_size = 0, out_size = 0;
     if (ccsds123_get_file_size(input_file, &in_size) == 0 && ccsds123_get_file_size(bitstream_path, &out_size) == 0 && out_size > 0) {
