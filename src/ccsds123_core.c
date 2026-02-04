@@ -20,6 +20,10 @@
 #define MAX_TABLE_STR 512
 
 #include "hybrid_tables_data.h"
+#define code_table_input hybrid_code_table_input
+#define code_table_output hybrid_code_table_output
+#define flush_table_prefix hybrid_flush_table_prefix
+#define flush_table_word hybrid_flush_table_word
 
 #define clip_i64 ccsds123_clip_i64
 #define sign_i64 ccsds123_sign_i64
@@ -179,11 +183,6 @@ typedef struct {
 
 static const int input_symbol_limit[16] = {12,10,8,6,6,4,4,4,2,2,2,2,2,2,2,0};
 static const int threshold_table[16] = {303336,225404,166979,128672,95597,69670,50678,34898,23331,14935,9282,5510,3195,1928,1112,408};
-
-#define code_table_input hybrid_code_table_input
-#define code_table_output hybrid_code_table_output
-#define flush_table_prefix hybrid_flush_table_prefix
-#define flush_table_word hybrid_flush_table_word
 
 /* -------------- Header helpers -------------- */
 
@@ -773,60 +772,6 @@ static void header_build_bitstreams(Header *h) {
     header_encode_entropy(h, &h->header_bitstream, &h->optional_tables_bitstream);
 }
 
-static void header_get_error_limits_bitstream(const Header *h, BitWriter *bw) {
-    bw_init(bw);
-    if (h->periodic_error_updating_flag == PEU_NOT_USED) return;
-    int y_size = header_get_y_size(h);
-    int period = 1 << h->error_update_period_exponent;
-    int updates = (y_size + period - 1) / period;
-
-    for (int i = 0; i < updates; i++) {
-        if (h->quantizer_fidelity_control_method != QF_REL) {
-            if (h->absolute_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
-                bw_append_bits_u64(bw, (uint64_t)h->periodic_absolute_error_limit_table[i * header_get_z_size(h)], 16);
-            } else {
-                int z = header_get_z_size(h);
-                for (int j = 0; j < z; j++) {
-                    bw_append_bits_u64(bw, (uint64_t)h->periodic_absolute_error_limit_table[i * z + j], 16);
-                }
-            }
-        }
-        if (h->quantizer_fidelity_control_method != QF_ABS) {
-            if (h->relative_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
-                bw_append_bits_u64(bw, (uint64_t)h->periodic_relative_error_limit_table[i * header_get_z_size(h)], 16);
-            } else {
-                int z = header_get_z_size(h);
-                for (int j = 0; j < z; j++) {
-                    bw_append_bits_u64(bw, (uint64_t)h->periodic_relative_error_limit_table[i * z + j], 16);
-                }
-            }
-        }
-    }
-}
-
-static int header_save_binaries(Header *h, const char *out_dir) {
-    char path[MAX_PATH_LEN];
-    header_build_bitstreams(h);
-
-    if (build_out_path(out_dir, "header.bin", path, sizeof(path)) != 0) return -1;
-    if (bw_write_to_file(&h->header_bitstream, path) != 0) return -1;
-
-    if (build_out_path(out_dir, "optional_tables.bin", path, sizeof(path)) != 0) return -1;
-    if (bw_write_to_file(&h->optional_tables_bitstream, path) != 0) return -1;
-
-    BitWriter err_bw;
-    header_get_error_limits_bitstream(h, &err_bw);
-    if (build_out_path(out_dir, "error_limits.bin", path, sizeof(path)) != 0) {
-        bw_free(&err_bw);
-        return -1;
-    }
-    if (bw_write_to_file(&err_bw, path) != 0) {
-        bw_free(&err_bw);
-        return -1;
-    }
-    bw_free(&err_bw);
-    return 0;
-}
 
 /* ---------------- Predictor ---------------- */
 
@@ -1891,6 +1836,9 @@ static void hyb_encode_image_tail(HybridEncoder *enc, char active_prefix[16][MAX
 }
 
 static int hyb_run(HybridEncoder *enc) {
+#if defined(HYBRID_TABLES_EXTERNAL)
+    if (hyb_load_tables_once() != 0) return -1;
+#endif
     if (hyb_init_constants(enc) != 0) return -1;
     if (hyb_init_arrays(enc) != 0) return -1;
 
@@ -2261,25 +2209,6 @@ static int build_out_path(const char *out_dir, const char *file_name, char *path
     return 0;
 }
 
-static int write_hybrid_initial_accu(const char *out_dir, HybridEncoder *enc, int z, int dyn_bits, int initial_count_exponent) {
-    BitWriter bw; bw_init(&bw);
-    int bits = dyn_bits + initial_count_exponent;
-    for (int zi = 0; zi < z; zi++) {
-        int x = header_get_x_size(enc->header);
-        int64_t acc = enc->accumulator[idx3(0, 0, zi, x, z)];
-        bw_append_bits_u64(&bw, (uint64_t)acc, bits);
-    }
-    bw_pad_to_byte(&bw);
-
-    char path[MAX_PATH_LEN];
-    if (build_out_path(out_dir, "hybrid_initial_accumulator.bin", path, sizeof(path)) != 0) {
-        bw_free(&bw);
-        return -1;
-    }
-    int rc = bw_write_to_file(&bw, path);
-    bw_free(&bw);
-    return rc;
-}
 
 static int write_bitstream_with_header(const char *out_dir, Header *h, BitWriter *payload) {
     BitWriter full; bw_init(&full);
@@ -2299,7 +2228,7 @@ static int write_bitstream_with_header(const char *out_dir, Header *h, BitWriter
     for (int i = 0; i < fill; i++) bw_append_bit(&full, 0);
 
     char path[MAX_PATH_LEN];
-    if (build_out_path(out_dir, "z-output-bitstream.bin", path, sizeof(path)) != 0) {
+    if (build_out_path(out_dir, "output.bin", path, sizeof(path)) != 0) {
         bw_free(&full);
         return -1;
     }
@@ -2368,24 +2297,6 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
     }
     pred_ready = 1;
 
-    const char *dump_mqi = getenv("CCSDS123_DUMP_MQI");
-    if (dump_mqi && dump_mqi[0] != '\0') {
-        char path[MAX_PATH_LEN];
-        if (build_out_path(out_dir, "mqi_dump.bin", path, sizeof(path)) != 0) goto cleanup;
-        FILE *f = fopen(path, "wb");
-        if (f) {
-            size_t count = (size_t)header_get_x_size(&h) * (size_t)header_get_y_size(&h) * (size_t)header_get_z_size(&h);
-            fwrite(pred.mapped_quantizer_index, sizeof(int64_t), count, f);
-            fclose(f);
-        }
-    }
-
-    int rc = header_save_binaries(&h, out_dir);
-    if (rc != 0) {
-        fprintf(stderr, "Failed to write header binaries for %s\n", raw_path);
-        goto cleanup;
-    }
-
     if (h.entropy_coder_type == ENTROPY_HYBRID) {
         HybridEncoder enc;
         hyb_init(&enc, &h, &ic, pred.mapped_quantizer_index);
@@ -2396,11 +2307,6 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
         }
         if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
             fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
-            hyb_free(&enc);
-            goto cleanup;
-        }
-        if (write_hybrid_initial_accu(out_dir, &enc, z, ic.dynamic_range_bits, enc.initial_count_exponent) != 0) {
-            fprintf(stderr, "Failed writing hybrid accumulator for %s\n", raw_path);
             hyb_free(&enc);
             goto cleanup;
         }
@@ -2418,11 +2324,6 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
             sa_free(&enc);
             goto cleanup;
         }
-        /* Empty hybrid accumulator for non-hybrid coder */
-        char path[MAX_PATH_LEN];
-        if (build_out_path(out_dir, "hybrid_initial_accumulator.bin", path, sizeof(path)) != 0) goto cleanup;
-        FILE *f = fopen(path, "wb");
-        if (f) fclose(f);
         sa_free(&enc);
     } else {
         BlockAdaptiveEncoder enc;
@@ -2437,10 +2338,6 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
             ba_free(&enc);
             goto cleanup;
         }
-        char path[MAX_PATH_LEN];
-        if (build_out_path(out_dir, "hybrid_initial_accumulator.bin", path, sizeof(path)) != 0) goto cleanup;
-        FILE *f = fopen(path, "wb");
-        if (f) fclose(f);
         ba_free(&enc);
     }
 
@@ -2529,7 +2426,7 @@ int main(int argc, char **argv) {
     build_output_folder_path(output_dir, input_file, ael, out_dir);
 
     char bitstream_path[MAX_PATH_LEN];
-    if (build_out_path(out_dir, "z-output-bitstream.bin", bitstream_path, sizeof(bitstream_path)) != 0) {
+    if (build_out_path(out_dir, "output.bin", bitstream_path, sizeof(bitstream_path)) != 0) {
         fprintf(stderr, "Warning: could not compute compression factor.\n");
         printf("Done compressing.\n");
         return 0;
