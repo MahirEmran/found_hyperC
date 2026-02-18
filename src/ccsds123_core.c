@@ -39,6 +39,7 @@
 #define read_sample ccsds123_read_sample
 #define load_raw_bip ccsds123_load_raw_bip
 #define build_output_folder_path ccsds123_build_output_folder_path
+#define build_output_filename ccsds123_build_output_filename
 #define get_file_size ccsds123_get_file_size
 
 static int build_out_path(const char *out_dir, const char *file_name, char *path, size_t path_len);
@@ -1630,7 +1631,7 @@ static int build_out_path(const char *out_dir, const char *file_name, char *path
 }
 
 
-static int write_bitstream_with_header(const char *out_dir, Header *h, BitWriter *payload) {
+static int write_bitstream_with_header(const char *out_dir, const char *out_file_name, Header *h, BitWriter *payload) {
     BitWriter full; bw_init(&full);
     header_build_bitstreams(h);
 
@@ -1648,7 +1649,7 @@ static int write_bitstream_with_header(const char *out_dir, Header *h, BitWriter
     for (int i = 0; i < fill; i++) bw_append_bit(&full, 0);
 
     char path[MAX_PATH_LEN];
-    if (build_out_path(out_dir, "output.bin", path, sizeof(path)) != 0) {
+    if (build_out_path(out_dir, out_file_name, path, sizeof(path)) != 0) {
         bw_free(&full);
         return -1;
     }
@@ -1658,11 +1659,13 @@ static int write_bitstream_with_header(const char *out_dir, Header *h, BitWriter
 }
 
 static int compress_one_image(const char *raw_path, const char *output_root, int ael,
-                              int override_x, int override_y, int override_z, const char *override_dtype) {
+                              int override_x, int override_y, int override_z, const char *override_dtype,
+                              int64_t *image_sample_buf, size_t image_sample_len) {
     Header h;
     header_init_defaults(&h);
     int result = -1;
-    int64_t *image_sample = NULL;
+    int64_t *image_sample = image_sample_buf;
+    int owns_image_sample = 0;
     Predictor pred;
     int pred_ready = 0;
     char dtype[16] = {0};
@@ -1702,10 +1705,25 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
     char out_dir[MAX_PATH_LEN];
     if (make_output_folder(output_root, raw_path, ael, out_dir) != 0) goto cleanup;
 
+    char out_file_name[MAX_PATH_LEN];
+    if (build_output_filename(raw_path, out_file_name, sizeof(out_file_name)) != 0) {
+        fprintf(stderr, "Output file name too long: %s\n", raw_path);
+        goto cleanup;
+    }
+
     /* load image */
     /* dtype/x/y/z already resolved above */
+    size_t image_sample_count = (size_t)x * (size_t)y * (size_t)z;
+    if (!image_sample) {
+        image_sample = (int64_t *)malloc(sizeof(int64_t) * image_sample_count);
+        if (!image_sample) goto cleanup;
+        owns_image_sample = 1;
+    } else if (image_sample_len < image_sample_count) {
+        fprintf(stderr, "Provided image buffer is too small for %zu samples.\n", image_sample_count);
+        goto cleanup;
+    }
 
-    if (load_raw_bip(raw_path, dtype, z, y, x, &image_sample) != 0) goto cleanup;
+    if (load_raw_bip(raw_path, dtype, z, y, x, image_sample, image_sample_count) != 0) goto cleanup;
 
     ImageConstants ic;
     image_constants_init(&ic, &h);
@@ -1725,7 +1743,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
             ba_free(&enc);
             goto cleanup;
         }
-        if (write_bitstream_with_header(out_dir, &h, &enc.bitstream) != 0) {
+        if (write_bitstream_with_header(out_dir, out_file_name, &h, &enc.bitstream) != 0) {
             fprintf(stderr, "Failed writing bitstream for %s\n", raw_path);
             ba_free(&enc);
             goto cleanup;
@@ -1737,7 +1755,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
 
 cleanup:
     if (pred_ready) predictor_free(&pred);
-    free(image_sample);
+    if (owns_image_sample) free(image_sample);
     header_free(&h);
     return result;
 }
@@ -1754,7 +1772,15 @@ static int ends_with_raw(const char *name) {
 
 int ccsds123_compress_one_image(const char *raw_path, const char *output_root, int ael,
                                 int override_x, int override_y, int override_z, const char *override_dtype) {
-    return compress_one_image(raw_path, output_root, ael, override_x, override_y, override_z, override_dtype);
+    return compress_one_image(raw_path, output_root, ael, override_x, override_y, override_z, override_dtype,
+                              NULL, 0);
+}
+
+int ccsds123_compress_with_buffer(const char *raw_path, const char *output_root, int ael,
+                                            int override_x, int override_y, int override_z, const char *override_dtype,
+                                            int64_t *image_sample_buf, size_t image_sample_len) {
+    return compress_one_image(raw_path, output_root, ael, override_x, override_y, override_z, override_dtype,
+                              image_sample_buf, image_sample_len);
 }
 
 int ccsds123_ends_with_raw(const char *name) {

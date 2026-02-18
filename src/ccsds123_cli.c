@@ -68,8 +68,15 @@ int main(int argc, char **argv) {
     char out_dir[CCSDS123_MAX_PATH_LEN];
     ccsds123_build_output_folder_path(output_dir, input_file, ael, out_dir);
 
+    char out_file_name[CCSDS123_MAX_PATH_LEN];
+    if (ccsds123_build_output_filename(input_file, out_file_name, sizeof(out_file_name)) != 0) {
+        fprintf(stderr, "Warning: could not compute compression factor.\n");
+        printf("Done.\n");
+        return 0;
+    }
+
     char bitstream_path[CCSDS123_MAX_PATH_LEN];
-    if (build_out_path(out_dir, "output.bin", bitstream_path, sizeof(bitstream_path)) != 0) {
+    if (build_out_path(out_dir, out_file_name, bitstream_path, sizeof(bitstream_path)) != 0) {
         fprintf(stderr, "Warning: could not compute compression factor.\n");
         printf("Done.\n");
         return 0;

@@ -2,18 +2,43 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include "ccsds123_io.h"
 #include "ccsds123_utils.h"
 
 int ccsds123_ensure_dir(const char *path) {
+    if (!path || path[0] == '\0') return -1;
+
     struct stat st;
     if (stat(path, &st) == 0) {
         if (S_ISDIR(st.st_mode)) return 0;
         fprintf(stderr, "Output path exists and is not a directory: %s\n", path);
         return -1;
     }
-    if (mkdir(path, 0755) != 0) {
+
+    char tmp[CCSDS123_MAX_PATH_LEN];
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    size_t len = strlen(tmp);
+    while (len > 0 && tmp[len - 1] == '/') {
+        tmp[len - 1] = '\0';
+        len--;
+    }
+
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                perror("mkdir");
+                return -1;
+            }
+            *p = '/';
+        }
+    }
+
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
         perror("mkdir");
         return -1;
     }
@@ -89,13 +114,16 @@ int64_t ccsds123_read_sample(FILE *f, const char *dtype) {
     return 0;
 }
 
-int ccsds123_load_raw_bip(const char *path, const char *dtype, int z, int y, int x, int64_t **out) {
+int ccsds123_load_raw_bip(const char *path, const char *dtype, int z, int y, int x,
+                          int64_t *out_buf, size_t out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
     size_t n = (size_t)x * (size_t)y * (size_t)z;
-    int64_t *buf = (int64_t *)malloc(sizeof(int64_t) * n);
-    if (!buf) { fclose(f); return -1; }
+    if (!out_buf || out_len < n) {
+        fclose(f);
+        return -1;
+    }
 
     /* file is BSQ: z, y, x */
     for (int zi = 0; zi < z; zi++) {
@@ -103,13 +131,12 @@ int ccsds123_load_raw_bip(const char *path, const char *dtype, int z, int y, int
             for (int xi = 0; xi < x; xi++) {
                 int64_t v = ccsds123_read_sample(f, dtype);
                 size_t idx = ccsds123_idx3(yi, xi, zi, x, z); /* convert to BIP */
-                buf[idx] = v;
+                out_buf[idx] = v;
             }
         }
     }
 
     fclose(f);
-    *out = buf;
     return 0;
 }
 
@@ -117,6 +144,29 @@ void ccsds123_build_output_folder_path(const char *output_root, const char *raw_
     (void)raw_path;
     (void)ael;
     snprintf(out_dir, CCSDS123_MAX_PATH_LEN, "%s", output_root);
+}
+
+int ccsds123_build_output_filename(const char *raw_path, char *out_name, size_t out_len) {
+    if (!raw_path || !out_name || out_len == 0) return -1;
+
+    const char *base = strrchr(raw_path, '/');
+    base = base ? base + 1 : raw_path;
+
+    size_t name_len = strlen(base);
+    if (name_len >= 4) {
+        const char *ext = base + name_len - 4;
+        if ((ext[0] == '.') &&
+            (ext[1] == 'r' || ext[1] == 'R') &&
+            (ext[2] == 'a' || ext[2] == 'A') &&
+            (ext[3] == 'w' || ext[3] == 'W')) {
+            name_len -= 4;
+        }
+    }
+
+    if (name_len + 1 > out_len) return -1;
+    memcpy(out_name, base, name_len);
+    out_name[name_len] = '\0';
+    return 0;
 }
 
 int ccsds123_get_file_size(const char *path, long long *out_size) {
