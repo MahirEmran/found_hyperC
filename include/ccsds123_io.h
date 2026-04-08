@@ -14,9 +14,14 @@ int ccsds123_parse_raw_filename(const char *path, char *dtype_out, int *z_out, i
 int64_t ccsds123_read_sample(FILE *f, const char *dtype);
 int ccsds123_load_raw_bip(const char *path, const char *dtype, int z, int y, int x,
 						  int64_t *out_buf, size_t out_len);
+int ccsds123_write_raw_bsq(const char *path, const char *dtype, int z, int y, int x,
+                           const int64_t *samples, size_t sample_len);
 void ccsds123_build_output_folder_path(const char *output_root, const char *raw_path, int ael, char *out_dir);
 int ccsds123_build_output_filename(const char *raw_path, char *out_name, size_t out_len);
+int ccsds123_build_decompressed_filename(const char *bitstream_path, const char *dtype,
+                                         int z, int y, int x, char *out_name, size_t out_len);
 int ccsds123_get_file_size(const char *path, long long *out_size);
+int ccsds123_ends_with_bin(const char *name);
 
 #ifdef __cplusplus
 }

@@ -140,6 +140,91 @@ int ccsds123_load_raw_bip(const char *path, const char *dtype, int z, int y, int
     return 0;
 }
 
+static int write_sample(FILE *f, const char *dtype, int64_t value) {
+    if (strcmp(dtype, "u8be") == 0 || strcmp(dtype, "u8le") == 0 ||
+        strcmp(dtype, "s8be") == 0 || strcmp(dtype, "s8le") == 0 ||
+        strcmp(dtype, "rgb8") == 0) {
+        uint8_t v = (uint8_t)value;
+        return (fwrite(&v, 1, 1, f) == 1) ? 0 : -1;
+    }
+
+    if (strstr(dtype, "16") != NULL) {
+        uint16_t v = (uint16_t)value;
+        uint8_t b[2];
+        int be = (strstr(dtype, "le") == NULL);
+        if (be) {
+            b[0] = (uint8_t)(v >> 8);
+            b[1] = (uint8_t)(v & 0xffu);
+        } else {
+            b[0] = (uint8_t)(v & 0xffu);
+            b[1] = (uint8_t)(v >> 8);
+        }
+        return (fwrite(b, 1, 2, f) == 2) ? 0 : -1;
+    }
+
+    if (strstr(dtype, "32") != NULL) {
+        uint32_t v = (uint32_t)value;
+        uint8_t b[4];
+        int be = (strstr(dtype, "le") == NULL);
+        if (be) {
+            b[0] = (uint8_t)(v >> 24);
+            b[1] = (uint8_t)((v >> 16) & 0xffu);
+            b[2] = (uint8_t)((v >> 8) & 0xffu);
+            b[3] = (uint8_t)(v & 0xffu);
+        } else {
+            b[0] = (uint8_t)(v & 0xffu);
+            b[1] = (uint8_t)((v >> 8) & 0xffu);
+            b[2] = (uint8_t)((v >> 16) & 0xffu);
+            b[3] = (uint8_t)(v >> 24);
+        }
+        return (fwrite(b, 1, 4, f) == 4) ? 0 : -1;
+    }
+
+    if (strstr(dtype, "64") != NULL) {
+        uint64_t v = (uint64_t)value;
+        uint8_t b[8];
+        int be = (strstr(dtype, "le") == NULL);
+        if (be) {
+            for (int i = 0; i < 8; i++) {
+                b[i] = (uint8_t)(v >> (56 - 8 * i));
+            }
+        } else {
+            for (int i = 0; i < 8; i++) {
+                b[i] = (uint8_t)(v >> (8 * i));
+            }
+        }
+        return (fwrite(b, 1, 8, f) == 8) ? 0 : -1;
+    }
+
+    return -1;
+}
+
+int ccsds123_write_raw_bsq(const char *path, const char *dtype, int z, int y, int x,
+                           const int64_t *samples, size_t sample_len) {
+    if (!path || !dtype || !samples) return -1;
+
+    size_t needed = (size_t)z * (size_t)y * (size_t)x;
+    if (sample_len < needed) return -1;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+
+    for (int zi = 0; zi < z; zi++) {
+        for (int yi = 0; yi < y; yi++) {
+            for (int xi = 0; xi < x; xi++) {
+                size_t idx = ccsds123_idx3(yi, xi, zi, x, z);
+                if (write_sample(f, dtype, samples[idx]) != 0) {
+                    fclose(f);
+                    return -1;
+                }
+            }
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
 void ccsds123_build_output_folder_path(const char *output_root, const char *raw_path, int ael, char *out_dir) {
     (void)raw_path;
     (void)ael;
@@ -169,9 +254,43 @@ int ccsds123_build_output_filename(const char *raw_path, char *out_name, size_t 
     return 0;
 }
 
+int ccsds123_build_decompressed_filename(const char *bitstream_path, const char *dtype,
+                                         int z, int y, int x, char *out_name, size_t out_len) {
+    if (!bitstream_path || !dtype || !out_name || out_len == 0) return -1;
+
+    const char *base = strrchr(bitstream_path, '/');
+    base = base ? base + 1 : bitstream_path;
+
+    size_t name_len = strlen(base);
+    if (name_len >= 4) {
+        const char *ext = base + name_len - 4;
+        if ((ext[0] == '.') &&
+            (ext[1] == 'b' || ext[1] == 'B') &&
+            (ext[2] == 'i' || ext[2] == 'I') &&
+            (ext[3] == 'n' || ext[3] == 'N')) {
+            name_len -= 4;
+        }
+    }
+
+    int written = snprintf(out_name, out_len, "%.*s-%s-%dx%dx%d.raw",
+                           (int)name_len, base, dtype, z, y, x);
+    if (written < 0 || (size_t)written >= out_len) return -1;
+    return 0;
+}
+
 int ccsds123_get_file_size(const char *path, long long *out_size) {
     struct stat st;
     if (stat(path, &st) != 0) return -1;
     *out_size = (long long)st.st_size;
     return 0;
+}
+
+int ccsds123_ends_with_bin(const char *name) {
+    size_t n = strlen(name);
+    if (n < 4) return 0;
+    const char *ext = name + n - 4;
+    return (ext[0] == '.') &&
+           (ext[1] == 'b' || ext[1] == 'B') &&
+           (ext[2] == 'i' || ext[2] == 'I') &&
+           (ext[3] == 'n' || ext[3] == 'N');
 }

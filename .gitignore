@@ -11,3 +11,5 @@ data/temp/**
 doc/**
 **.raw
 output/
+data/.DS_Store
+.DS_Store

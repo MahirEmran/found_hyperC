@@ -15,7 +15,7 @@ static int build_out_path(const char *out_dir, const char *file_name, char *path
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input_raw_file> <output_dir> [ael] [--x N --y N --z N --dtype STR]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input_file> <output_dir> [ael] [--x N --y N --z N --dtype STR]\n", argv[0]);
         return 2;
     }
 
@@ -52,44 +52,54 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!ccsds123_ends_with_raw(input_file)) {
-        fprintf(stderr, "Input must be a .raw file: %s\n", input_file);
-        return 2;
-    }
-
     if (ccsds123_ensure_dir(output_dir) != 0) return 1;
 
-    printf("[ccsds123.0-b-2] %s (AEL=%d)\n", input_file, ael);
-    if (ccsds123_compress_one_image(input_file, output_dir, ael, override_x, override_y, override_z, override_dtype) != 0) {
-        fprintf(stderr, "Failed: %s\n", input_file);
-        return 1;
-    }
+    if (ccsds123_ends_with_raw(input_file)) {
+        printf("[ccsds123.0-b-2] %s (AEL=%d)\n", input_file, ael);
+        if (ccsds123_compress_one_image(input_file, output_dir, ael, override_x, override_y, override_z, override_dtype) != 0) {
+            fprintf(stderr, "Failed: %s\n", input_file);
+            return 1;
+        }
 
-    char out_dir[CCSDS123_MAX_PATH_LEN];
-    ccsds123_build_output_folder_path(output_dir, input_file, ael, out_dir);
+        char out_dir[CCSDS123_MAX_PATH_LEN];
+        ccsds123_build_output_folder_path(output_dir, input_file, ael, out_dir);
 
-    char out_file_name[CCSDS123_MAX_PATH_LEN];
-    if (ccsds123_build_output_filename(input_file, out_file_name, sizeof(out_file_name)) != 0) {
-        fprintf(stderr, "Warning: could not compute compression factor.\n");
+        char out_file_name[CCSDS123_MAX_PATH_LEN];
+        if (ccsds123_build_output_filename(input_file, out_file_name, sizeof(out_file_name)) != 0) {
+            fprintf(stderr, "Warning: could not compute compression factor.\n");
+            printf("Done.\n");
+            return 0;
+        }
+
+        char bitstream_path[CCSDS123_MAX_PATH_LEN];
+        if (build_out_path(out_dir, out_file_name, bitstream_path, sizeof(bitstream_path)) != 0) {
+            fprintf(stderr, "Warning: could not compute compression factor.\n");
+            printf("Done.\n");
+            return 0;
+        }
+
+        long long in_size = 0, out_size = 0;
+        if (ccsds123_get_file_size(input_file, &in_size) == 0 && ccsds123_get_file_size(bitstream_path, &out_size) == 0 && out_size > 0) {
+            double factor = (double)in_size / (double)out_size;
+            printf("Compression factor: %.4f (input %lld bytes, output %lld bytes)\n", factor, in_size, out_size);
+        } else {
+            fprintf(stderr, "Warning: could not compute compression factor.\n");
+        }
+
         printf("Done.\n");
         return 0;
     }
 
-    char bitstream_path[CCSDS123_MAX_PATH_LEN];
-    if (build_out_path(out_dir, out_file_name, bitstream_path, sizeof(bitstream_path)) != 0) {
-        fprintf(stderr, "Warning: could not compute compression factor.\n");
+    if (ccsds123_ends_with_bin(input_file)) {
+        printf("[ccsds123.0-b-2] %s (decode)\n", input_file);
+        if (ccsds123_decompress_one_image(input_file, output_dir) != 0) {
+            fprintf(stderr, "Failed: %s\n", input_file);
+            return 1;
+        }
         printf("Done.\n");
         return 0;
     }
 
-    long long in_size = 0, out_size = 0;
-    if (ccsds123_get_file_size(input_file, &in_size) == 0 && ccsds123_get_file_size(bitstream_path, &out_size) == 0 && out_size > 0) {
-        double factor = (double)in_size / (double)out_size;
-        printf("Compression factor: %.4f (input %lld bytes, output %lld bytes)\n", factor, in_size, out_size);
-    } else {
-        fprintf(stderr, "Warning: could not compute compression factor.\n");
-    }
-
-    printf("Done.\n");
-    return 0;
+    fprintf(stderr, "Input must be a .raw or .bin file: %s\n", input_file);
+    return 2;
 }

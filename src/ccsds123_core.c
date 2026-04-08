@@ -13,6 +13,36 @@
  */
 
 #define MAX_PATH_LEN CCSDS123_MAX_PATH_LEN
+#ifndef CCSDS123_NO_HEAP_WORKSPACE_BYTES
+#define CCSDS123_NO_HEAP_WORKSPACE_BYTES (96u * 1024u * 1024u)
+#endif
+
+typedef struct {
+    uint8_t *base;
+    size_t cap;
+    size_t offset;
+    int enabled;
+} NoHeapWorkspace;
+
+static uint8_t g_no_heap_workspace[CCSDS123_NO_HEAP_WORKSPACE_BYTES];
+static NoHeapWorkspace g_workspace = {0};
+
+static void workspace_begin_no_heap(void);
+static void workspace_end_no_heap(void);
+static void *workspace_alloc(size_t size);
+static void *workspace_calloc(size_t count, size_t size);
+static void workspace_free(void *ptr);
+static int64_t *alloc_i64_local(size_t n);
+
+static void bw_init_local(BitWriter *bw);
+static void bw_free_local(BitWriter *bw);
+static int bw_reserve_bits_local(BitWriter *bw, size_t extra_bits);
+static void bw_append_bit_local(BitWriter *bw, int bit);
+static void bw_append_bits_u64_local(BitWriter *bw, uint64_t value, int bits);
+static void bw_append_bits_str_local(BitWriter *bw, const char *bits);
+static void bw_append_from_bw_local(BitWriter *dst, const BitWriter *src);
+static void bw_pad_to_byte_local(BitWriter *bw);
+static int bw_write_to_file_local(BitWriter *bw, const char *path);
 
 #define clip_i64 ccsds123_clip_i64
 #define sign_i64 ccsds123_sign_i64
@@ -20,26 +50,28 @@
 #define modulo_star_i64 ccsds123_modulo_star_i64
 #define floor_div_i64 ccsds123_floor_div_i64
 
-#define alloc_i64 ccsds123_alloc_i64
+#define alloc_i64 alloc_i64_local
 #define idx3 ccsds123_idx3
 #define idx4 ccsds123_idx4
 
-#define bw_init ccsds123_bw_init
-#define bw_free ccsds123_bw_free
-#define bw_reserve_bits ccsds123_bw_reserve_bits
-#define bw_append_bit ccsds123_bw_append_bit
-#define bw_append_bits_u64 ccsds123_bw_append_bits_u64
-#define bw_append_bits_str ccsds123_bw_append_bits_str
-#define bw_append_from_bw ccsds123_bw_append_from_bw
-#define bw_pad_to_byte ccsds123_bw_pad_to_byte
-#define bw_write_to_file ccsds123_bw_write_to_file
+#define bw_init bw_init_local
+#define bw_free bw_free_local
+#define bw_reserve_bits bw_reserve_bits_local
+#define bw_append_bit bw_append_bit_local
+#define bw_append_bits_u64 bw_append_bits_u64_local
+#define bw_append_bits_str bw_append_bits_str_local
+#define bw_append_from_bw bw_append_from_bw_local
+#define bw_pad_to_byte bw_pad_to_byte_local
+#define bw_write_to_file bw_write_to_file_local
 
 #define ensure_dir ccsds123_ensure_dir
 #define parse_raw_filename ccsds123_parse_raw_filename
 #define read_sample ccsds123_read_sample
 #define load_raw_bip ccsds123_load_raw_bip
+#define write_raw_bsq ccsds123_write_raw_bsq
 #define build_output_folder_path ccsds123_build_output_folder_path
 #define build_output_filename ccsds123_build_output_filename
+#define build_decompressed_filename ccsds123_build_decompressed_filename
 #define get_file_size ccsds123_get_file_size
 
 static int build_out_path(const char *out_dir, const char *file_name, char *path, size_t path_len);
@@ -157,6 +189,216 @@ typedef struct {
     int64_t middle_sample_value;
 } ImageConstants;
 
+typedef struct {
+    const uint8_t *data;
+    size_t bit_len;
+    size_t bit_pos;
+} BitReader;
+
+static void br_init(BitReader *br, const uint8_t *data, size_t byte_len) {
+    br->data = data;
+    br->bit_len = byte_len * 8;
+    br->bit_pos = 0;
+}
+
+static size_t br_bits_remaining(const BitReader *br) {
+    return (br->bit_pos <= br->bit_len) ? (br->bit_len - br->bit_pos) : 0;
+}
+
+static int br_read_bit(BitReader *br, int *bit_out) {
+    if (br_bits_remaining(br) < 1) return -1;
+    *bit_out = (br->data[br->bit_pos / 8] >> (7 - (br->bit_pos % 8))) & 1;
+    br->bit_pos += 1;
+    return 0;
+}
+
+static int br_read_bits_u64(BitReader *br, int bits, uint64_t *value_out) {
+    if (bits < 0 || bits > 64) return -1;
+    if ((size_t)bits > br_bits_remaining(br)) return -1;
+
+    uint64_t value = 0;
+    for (int i = 0; i < bits; i++) {
+        int bit = 0;
+        if (br_read_bit(br, &bit) != 0) return -1;
+        value = (value << 1) | (uint64_t)bit;
+    }
+    *value_out = value;
+    return 0;
+}
+
+static int br_align_to_byte(BitReader *br) {
+    size_t fill = (8 - (br->bit_pos % 8)) % 8;
+    if (fill > br_bits_remaining(br)) return -1;
+    br->bit_pos += fill;
+    return 0;
+}
+
+static int br_read_unary_zeroes(BitReader *br, int64_t *zero_count_out) {
+    int64_t count = 0;
+    for (;;) {
+        int bit = 0;
+        if (br_read_bit(br, &bit) != 0) return -1;
+        if (bit != 0) break;
+        count++;
+    }
+    *zero_count_out = count;
+    return 0;
+}
+
+static int64_t decode_twos_complement_u64(uint64_t value, int bits) {
+    if (bits <= 0) return 0;
+    if (bits >= 64) return (int64_t)value;
+    if ((value & (1ULL << (bits - 1))) != 0) {
+        return (int64_t)(value - (1ULL << bits));
+    }
+    return (int64_t)value;
+}
+
+static size_t align_up_size(size_t value, size_t alignment) {
+    size_t rem = value % alignment;
+    if (rem == 0) return value;
+    return value + (alignment - rem);
+}
+
+static void workspace_begin_no_heap(void) {
+    g_workspace.base = g_no_heap_workspace;
+    g_workspace.cap = CCSDS123_NO_HEAP_WORKSPACE_BYTES;
+    g_workspace.offset = 0;
+    g_workspace.enabled = 1;
+}
+
+static void workspace_end_no_heap(void) {
+    g_workspace.offset = 0;
+    g_workspace.enabled = 0;
+}
+
+static void *workspace_alloc(size_t size) {
+    if (size == 0) size = 1;
+
+    if (!g_workspace.enabled) {
+        return malloc(size);
+    }
+
+    size_t aligned = align_up_size(g_workspace.offset, sizeof(void *));
+    if (aligned > g_workspace.cap || size > (g_workspace.cap - aligned)) {
+        return NULL;
+    }
+
+    void *ptr = g_workspace.base + aligned;
+    g_workspace.offset = aligned + size;
+    return ptr;
+}
+
+static void *workspace_calloc(size_t count, size_t size) {
+    if (size != 0 && count > (SIZE_MAX / size)) return NULL;
+    size_t bytes = count * size;
+    void *ptr = workspace_alloc(bytes);
+    if (!ptr) return NULL;
+    memset(ptr, 0, bytes);
+    return ptr;
+}
+
+static void workspace_free(void *ptr) {
+    if (!ptr) return;
+
+    if (!g_workspace.enabled) {
+        free(ptr);
+        return;
+    }
+
+    /* In no-heap mode allocations come from the static workspace and are released
+       by resetting the workspace at the end of the call. */
+    if (ptr < (void *)g_workspace.base || ptr >= (void *)(g_workspace.base + g_workspace.cap)) {
+        free(ptr);
+    }
+}
+
+static int64_t *alloc_i64_local(size_t n) {
+    return (int64_t *)workspace_calloc(n, sizeof(int64_t));
+}
+
+static void bw_init_local(BitWriter *bw) {
+    bw->data = NULL;
+    bw->bit_len = 0;
+    bw->cap_bits = 0;
+}
+
+static void bw_free_local(BitWriter *bw) {
+    workspace_free(bw->data);
+    bw->data = NULL;
+    bw->bit_len = 0;
+    bw->cap_bits = 0;
+}
+
+static int bw_reserve_bits_local(BitWriter *bw, size_t extra_bits) {
+    size_t needed = bw->bit_len + extra_bits;
+    if (needed <= bw->cap_bits) return 0;
+
+    size_t new_cap_bits = bw->cap_bits ? bw->cap_bits : 1024;
+    while (new_cap_bits < needed) new_cap_bits *= 2;
+
+    size_t new_cap_bytes = (new_cap_bits + 7) / 8;
+    size_t old_cap_bytes = (bw->cap_bits + 7) / 8;
+
+    uint8_t *new_data = (uint8_t *)workspace_alloc(new_cap_bytes);
+    if (!new_data) return -1;
+
+    if (bw->data && old_cap_bytes > 0) memcpy(new_data, bw->data, old_cap_bytes);
+    if (new_cap_bytes > old_cap_bytes) memset(new_data + old_cap_bytes, 0, new_cap_bytes - old_cap_bytes);
+
+    workspace_free(bw->data);
+    bw->data = new_data;
+    bw->cap_bits = new_cap_bits;
+    return 0;
+}
+
+static void bw_append_bit_local(BitWriter *bw, int bit) {
+    if (bw_reserve_bits_local(bw, 1) != 0) return;
+    size_t byte_index = bw->bit_len / 8;
+    int bit_index = 7 - (int)(bw->bit_len % 8);
+    if (bit) bw->data[byte_index] |= (uint8_t)(1u << bit_index);
+    bw->bit_len += 1;
+}
+
+static void bw_append_bits_u64_local(BitWriter *bw, uint64_t value, int bits) {
+    for (int i = bits - 1; i >= 0; i--) {
+        int bit = (int)((value >> i) & 1u);
+        bw_append_bit_local(bw, bit);
+    }
+}
+
+static void bw_append_bits_str_local(BitWriter *bw, const char *bits) {
+    for (const char *p = bits; *p; p++) {
+        bw_append_bit_local(bw, *p == '1');
+    }
+}
+
+static void bw_append_from_bw_local(BitWriter *dst, const BitWriter *src) {
+    for (size_t bi = 0; bi < src->bit_len; bi++) {
+        int bit = (src->data[bi / 8] >> (7 - (bi % 8))) & 1;
+        bw_append_bit_local(dst, bit);
+    }
+}
+
+static void bw_pad_to_byte_local(BitWriter *bw) {
+    size_t fill = (8 - (bw->bit_len % 8)) % 8;
+    for (size_t i = 0; i < fill; i++) {
+        bw_append_bit_local(bw, 0);
+    }
+}
+
+static int bw_write_to_file_local(BitWriter *bw, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t bytes = (bw->bit_len + 7) / 8;
+    if (bytes > 0 && fwrite(bw->data, 1, bytes, f) != bytes) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    return 0;
+}
+
 /* -------------- Header helpers -------------- */
 
 static int header_get_x_size(const Header *h) { return (h->x_size == 0) ? 65536 : h->x_size; }
@@ -261,25 +503,25 @@ static void header_init_defaults(Header *h) {
 
 static void header_free(Header *h) {
     if (!h) return;
-    free(h->weight_init_table);
+    workspace_free(h->weight_init_table);
     h->weight_init_table = NULL;
-    free(h->weight_exponent_offset_table);
+    workspace_free(h->weight_exponent_offset_table);
     h->weight_exponent_offset_table = NULL;
 
-    free(h->absolute_error_limit_table);
+    workspace_free(h->absolute_error_limit_table);
     h->absolute_error_limit_table = NULL;
-    free(h->periodic_absolute_error_limit_table);
+    workspace_free(h->periodic_absolute_error_limit_table);
     h->periodic_absolute_error_limit_table = NULL;
-    free(h->relative_error_limit_table);
+    workspace_free(h->relative_error_limit_table);
     h->relative_error_limit_table = NULL;
-    free(h->periodic_relative_error_limit_table);
+    workspace_free(h->periodic_relative_error_limit_table);
     h->periodic_relative_error_limit_table = NULL;
 
-    free(h->damping_table_array);
+    workspace_free(h->damping_table_array);
     h->damping_table_array = NULL;
-    free(h->damping_offset_table_array);
+    workspace_free(h->damping_offset_table_array);
     h->damping_offset_table_array = NULL;
-    free(h->accumulator_init_table);
+    workspace_free(h->accumulator_init_table);
     h->accumulator_init_table = NULL;
 
     bw_free(&h->header_bitstream);
@@ -708,6 +950,335 @@ static void header_build_bitstreams(Header *h) {
     header_encode_entropy(h, &h->header_bitstream, &h->optional_tables_bitstream);
 }
 
+static int header_decode_essential(Header *h, BitReader *br) {
+    uint64_t value = 0;
+
+    if (br_read_bits_u64(br, 8, &value) != 0) return -1;
+    h->user_defined_data = (int)value;
+    if (br_read_bits_u64(br, 16, &value) != 0) return -1;
+    h->x_size = (int)value;
+    if (br_read_bits_u64(br, 16, &value) != 0) return -1;
+    h->y_size = (int)value;
+    if (br_read_bits_u64(br, 16, &value) != 0) return -1;
+    h->z_size = (int)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->sample_type = (SampleType)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->large_d_flag = (LargeDFlag)value;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->dynamic_range = (int)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->sample_encoding_order = (SampleEncodingOrder)value;
+    if (br_read_bits_u64(br, 16, &value) != 0) return -1;
+    h->sub_frame_interleaving_depth = (int)value;
+    if (br_read_bits_u64(br, 2, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 3, &value) != 0) return -1;
+    h->output_word_size = (int)value;
+    if (br_read_bits_u64(br, 2, &value) != 0) return -1;
+    h->entropy_coder_type = (EntropyCoderType)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 2, &value) != 0) return -1;
+    h->quantizer_fidelity_control_method = (QuantizerFidelityControlMethod)value;
+    if (br_read_bits_u64(br, 2, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+
+    if (h->entropy_coder_type != ENTROPY_BA) {
+        fprintf(stderr, "Only block-adaptive entropy coding is supported.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int header_decode_predictor_primary(Header *h, BitReader *br) {
+    uint64_t value = 0;
+
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->sample_representative_flag = (SampleRepresentativeFlag)value;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->prediction_bands_num = (int)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->prediction_mode = (PredictionMode)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->weight_exponent_offset_flag = (WeightExponentOffsetFlag)value;
+    if (br_read_bits_u64(br, 2, &value) != 0) return -1;
+    h->local_sum_type = (LocalSumType)value;
+    if (br_read_bits_u64(br, 6, &value) != 0) return -1;
+    h->register_size = (int)value;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->weight_component_resolution = (int)value;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->weight_update_change_interval = (int)value;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->weight_update_initial_parameter = (int)value;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->weight_update_final_parameter = (int)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->weight_exponent_offset_table_flag = (WeightExponentOffsetTableFlag)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->weight_init_method = (WeightInitMethod)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->weight_init_table_flag = (WeightInitTableFlag)value;
+    if (br_read_bits_u64(br, 5, &value) != 0) return -1;
+    h->weight_init_resolution = (int)value;
+
+    if (h->weight_init_method == WEIGHT_INIT_CUSTOM) {
+        if (h->weight_init_table_flag != WEIGHT_INIT_TABLE_INCLUDED) {
+            fprintf(stderr, "External weight-init tables are not supported.\n");
+            return -1;
+        }
+        header_init_weight_init_table(h);
+        if (!h->weight_init_table) return -1;
+
+        int z = header_get_z_size(h);
+        int c = h->prediction_bands_num + (h->prediction_mode == PRED_FULL ? 3 : 0);
+        for (int zi = 0; zi < z; zi++) {
+            int bands = (zi < h->prediction_bands_num) ? zi : h->prediction_bands_num;
+            int limit = bands + (h->prediction_mode == PRED_FULL ? 3 : 0);
+            for (int j = 0; j < limit; j++) {
+                if (br_read_bits_u64(br, h->weight_init_resolution, &value) != 0) return -1;
+                h->weight_init_table[(size_t)zi * c + j] = decode_twos_complement_u64(value, h->weight_init_resolution);
+            }
+        }
+        if (br_align_to_byte(br) != 0) return -1;
+    }
+
+    if (h->weight_exponent_offset_flag == WEO_NOT_ALL_ZERO) {
+        if (h->weight_exponent_offset_table_flag != WEO_TABLE_INCLUDED) {
+            fprintf(stderr, "External weight exponent offset tables are not supported.\n");
+            return -1;
+        }
+        header_init_weight_exponent_offset_table(h);
+        if (!h->weight_exponent_offset_table) return -1;
+
+        int z = header_get_z_size(h);
+        int c = h->prediction_bands_num + (h->prediction_mode == PRED_FULL ? 1 : 0);
+        for (int zi = 0; zi < z; zi++) {
+            int bands = (zi < h->prediction_bands_num) ? zi : h->prediction_bands_num;
+            int limit = bands + (h->prediction_mode == PRED_FULL ? 1 : 0);
+            for (int j = 0; j < limit; j++) {
+                if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+                h->weight_exponent_offset_table[(size_t)zi * c + j] = decode_twos_complement_u64(value, 4);
+            }
+        }
+        if (br_align_to_byte(br) != 0) return -1;
+    }
+
+    return 0;
+}
+
+static int header_decode_quantization_update(Header *h, BitReader *br) {
+    uint64_t value = 0;
+
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->periodic_error_updating_flag = (PeriodicErrorUpdatingFlag)value;
+    if (br_read_bits_u64(br, 2, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->error_update_period_exponent = (int)value;
+    return 0;
+}
+
+static int header_decode_quantization_abs(Header *h, BitReader *br) {
+    uint64_t value = 0;
+
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->absolute_error_limit_assignment_method = (ErrorLimitAssignmentMethod)value;
+    if (br_read_bits_u64(br, 2, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->absolute_error_limit_bit_depth = (int)value;
+
+    if (h->periodic_error_updating_flag == PEU_NOT_USED) {
+        int bit_depth = header_get_absolute_error_limit_bit_depth_value(h);
+        if (h->absolute_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
+            if (br_read_bits_u64(br, bit_depth, &value) != 0) return -1;
+            h->absolute_error_limit_value = (int)value;
+        } else {
+            int z = header_get_z_size(h);
+            header_init_absolute_error_limit_table(h);
+            if (!h->absolute_error_limit_table) return -1;
+            for (int zi = 0; zi < z; zi++) {
+                if (br_read_bits_u64(br, bit_depth, &value) != 0) return -1;
+                h->absolute_error_limit_table[zi] = (int64_t)value;
+            }
+        }
+        if (br_align_to_byte(br) != 0) return -1;
+    }
+
+    return 0;
+}
+
+static int header_decode_quantization_rel(Header *h, BitReader *br) {
+    uint64_t value = 0;
+
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->relative_error_limit_assignment_method = (ErrorLimitAssignmentMethod)value;
+    if (br_read_bits_u64(br, 2, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->relative_error_limit_bit_depth = (int)value;
+
+    if (h->periodic_error_updating_flag == PEU_NOT_USED) {
+        int bit_depth = header_get_relative_error_limit_bit_depth_value(h);
+        if (h->relative_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
+            if (br_read_bits_u64(br, bit_depth, &value) != 0) return -1;
+            h->relative_error_limit_value = (int)value;
+        } else {
+            int z = header_get_z_size(h);
+            header_init_relative_error_limit_table(h);
+            if (!h->relative_error_limit_table) return -1;
+            for (int zi = 0; zi < z; zi++) {
+                if (br_read_bits_u64(br, bit_depth, &value) != 0) return -1;
+                h->relative_error_limit_table[zi] = (int64_t)value;
+            }
+        }
+        if (br_align_to_byte(br) != 0) return -1;
+    }
+
+    return 0;
+}
+
+static int header_decode_sample_representative(Header *h, BitReader *br) {
+    uint64_t value = 0;
+
+    if (br_read_bits_u64(br, 5, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 3, &value) != 0) return -1;
+    h->sample_representative_resolution = (int)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->band_varying_damping_flag = (BandVaryingDampingFlag)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->damping_table_flag = (DampingTableFlag)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->fixed_damping_value = (int)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->band_varying_offset_flag = (BandVaryingOffsetFlag)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->damping_offset_table_flag = (OffsetTableFlag)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 4, &value) != 0) return -1;
+    h->fixed_offset_value = (int)value;
+
+    if (h->band_varying_damping_flag == BVDF_BAND_DEPENDENT) {
+        if (h->damping_table_flag != DAMP_INCLUDED) {
+            fprintf(stderr, "External damping tables are not supported.\n");
+            return -1;
+        }
+        header_init_damping_table(h);
+        if (!h->damping_table_array) return -1;
+        for (int zi = 0; zi < header_get_z_size(h); zi++) {
+            if (br_read_bits_u64(br, h->sample_representative_resolution, &value) != 0) return -1;
+            h->damping_table_array[zi] = (int64_t)value;
+        }
+        if (br_align_to_byte(br) != 0) return -1;
+    }
+
+    if (h->band_varying_offset_flag == BVOF_BAND_DEPENDENT) {
+        if (h->damping_offset_table_flag != OFFSET_INCLUDED) {
+            fprintf(stderr, "External damping offset tables are not supported.\n");
+            return -1;
+        }
+        header_init_damping_offset_table(h);
+        if (!h->damping_offset_table_array) return -1;
+        for (int zi = 0; zi < header_get_z_size(h); zi++) {
+            if (br_read_bits_u64(br, h->sample_representative_resolution, &value) != 0) return -1;
+            h->damping_offset_table_array[zi] = (int64_t)value;
+        }
+        if (br_align_to_byte(br) != 0) return -1;
+    }
+
+    return 0;
+}
+
+static int header_decode_entropy(Header *h, BitReader *br) {
+    uint64_t value = 0;
+
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    if (br_read_bits_u64(br, 2, &value) != 0) return -1;
+    h->block_size = (int)value;
+    if (br_read_bits_u64(br, 1, &value) != 0) return -1;
+    h->restricted_code_options_flag = (RestrictedCodeOptionsFlag)value;
+    if (br_read_bits_u64(br, 12, &value) != 0) return -1;
+    h->reference_sample_interval = (int)value;
+    return 0;
+}
+
+static int header_prepare_runtime_tables(Header *h) {
+    if (h->weight_init_method == WEIGHT_INIT_CUSTOM && !h->weight_init_table) {
+        fprintf(stderr, "Missing weight initialization table.\n");
+        return -1;
+    }
+
+    if (h->weight_exponent_offset_flag == WEO_NOT_ALL_ZERO && !h->weight_exponent_offset_table) {
+        fprintf(stderr, "Missing weight exponent offset table.\n");
+        return -1;
+    }
+
+    if (h->quantizer_fidelity_control_method == QF_ABS || h->quantizer_fidelity_control_method == QF_ABS_REL) {
+        if (h->periodic_error_updating_flag == PEU_NOT_USED) {
+            if (!h->absolute_error_limit_table) header_set_absolute_error_limit_table_default(h);
+        } else if (!h->periodic_absolute_error_limit_table) {
+            header_init_periodic_absolute_error_limit_table(h);
+        }
+    }
+
+    if (h->quantizer_fidelity_control_method == QF_REL || h->quantizer_fidelity_control_method == QF_ABS_REL) {
+        if (h->periodic_error_updating_flag == PEU_NOT_USED) {
+            if (!h->relative_error_limit_table) header_set_relative_error_limit_table_default(h);
+        } else if (!h->periodic_relative_error_limit_table) {
+            header_init_periodic_relative_error_limit_table(h);
+        }
+    }
+
+    if (!h->damping_table_array) {
+        if (h->band_varying_damping_flag == BVDF_BAND_INDEPENDENT) header_set_damping_table_default(h);
+        else {
+            fprintf(stderr, "Missing damping table.\n");
+            return -1;
+        }
+    }
+
+    if (!h->damping_offset_table_array) {
+        if (h->band_varying_offset_flag == BVOF_BAND_INDEPENDENT) header_set_damping_offset_table_default(h);
+        else {
+            fprintf(stderr, "Missing damping offset table.\n");
+            return -1;
+        }
+    }
+
+    if (!h->accumulator_init_table) header_set_accumulator_init_table_default(h);
+    return 0;
+}
+
+static int header_parse_from_bitstream(Header *h, BitReader *br) {
+    if (header_decode_essential(h, br) != 0) return -1;
+    if (header_decode_predictor_primary(h, br) != 0) return -1;
+
+    if (h->quantizer_fidelity_control_method != QF_LOSSLESS) {
+        if (h->sample_encoding_order != ORDER_BSQ) {
+            if (header_decode_quantization_update(h, br) != 0) return -1;
+        }
+        if (h->quantizer_fidelity_control_method != QF_REL) {
+            if (header_decode_quantization_abs(h, br) != 0) return -1;
+        }
+        if (h->quantizer_fidelity_control_method != QF_ABS) {
+            if (header_decode_quantization_rel(h, br) != 0) return -1;
+        }
+    }
+
+    if (h->sample_representative_flag == SR_INCLUDED) {
+        if (header_decode_sample_representative(h, br) != 0) return -1;
+    }
+
+    if (header_decode_entropy(h, br) != 0) return -1;
+    return header_prepare_runtime_tables(h);
+}
+
 
 /* ---------------- Predictor ---------------- */
 
@@ -753,49 +1324,49 @@ typedef struct {
 
 static void predictor_free(Predictor *p) {
     if (!p) return;
-    free(p->spectral_bands_used);
+    workspace_free(p->spectral_bands_used);
     p->spectral_bands_used = NULL;
-    free(p->weight_update_scaling_exponent);
+    workspace_free(p->weight_update_scaling_exponent);
     p->weight_update_scaling_exponent = NULL;
-    free(p->weight_exponent_offset);
+    workspace_free(p->weight_exponent_offset);
     p->weight_exponent_offset = NULL;
 
-    free(p->absolute_error_limits);
+    workspace_free(p->absolute_error_limits);
     p->absolute_error_limits = NULL;
-    free(p->relative_error_limits);
+    workspace_free(p->relative_error_limits);
     p->relative_error_limits = NULL;
 
-    free(p->local_sum);
+    workspace_free(p->local_sum);
     p->local_sum = NULL;
-    free(p->local_difference_vector);
+    workspace_free(p->local_difference_vector);
     p->local_difference_vector = NULL;
-    free(p->weight_vector);
+    workspace_free(p->weight_vector);
     p->weight_vector = NULL;
-    free(p->predicted_central_local_difference);
+    workspace_free(p->predicted_central_local_difference);
     p->predicted_central_local_difference = NULL;
-    free(p->high_resolution_predicted_sample_value);
+    workspace_free(p->high_resolution_predicted_sample_value);
     p->high_resolution_predicted_sample_value = NULL;
-    free(p->double_resolution_predicted_sample_value);
+    workspace_free(p->double_resolution_predicted_sample_value);
     p->double_resolution_predicted_sample_value = NULL;
-    free(p->predicted_sample_value);
+    workspace_free(p->predicted_sample_value);
     p->predicted_sample_value = NULL;
-    free(p->prediction_residual);
+    workspace_free(p->prediction_residual);
     p->prediction_residual = NULL;
-    free(p->maximum_error);
+    workspace_free(p->maximum_error);
     p->maximum_error = NULL;
-    free(p->quantizer_index);
+    workspace_free(p->quantizer_index);
     p->quantizer_index = NULL;
-    free(p->clipped_quantizer_bin_center);
+    workspace_free(p->clipped_quantizer_bin_center);
     p->clipped_quantizer_bin_center = NULL;
-    free(p->double_resolution_sample_representative);
+    workspace_free(p->double_resolution_sample_representative);
     p->double_resolution_sample_representative = NULL;
-    free(p->sample_representative);
+    workspace_free(p->sample_representative);
     p->sample_representative = NULL;
-    free(p->double_resolution_prediction_error);
+    workspace_free(p->double_resolution_prediction_error);
     p->double_resolution_prediction_error = NULL;
-    free(p->scaled_prediction_endpoint_difference);
+    workspace_free(p->scaled_prediction_endpoint_difference);
     p->scaled_prediction_endpoint_difference = NULL;
-    free(p->mapped_quantizer_index);
+    workspace_free(p->mapped_quantizer_index);
     p->mapped_quantizer_index = NULL;
 }
 
@@ -836,7 +1407,7 @@ static int predictor_init_constants(Predictor *p) {
 
     if (p->local_difference_values_num > 0) {
         size_t n = (size_t)z * (size_t)p->local_difference_values_num;
-        p->weight_exponent_offset = (double *)calloc(n, sizeof(double));
+        p->weight_exponent_offset = (double *)workspace_calloc(n, sizeof(double));
         if (!p->weight_exponent_offset) return -1;
         if (h->weight_exponent_offset_flag == WEO_NOT_ALL_ZERO && h->weight_exponent_offset_table) {
             if (h->prediction_mode == PRED_FULL) {
@@ -933,7 +1504,9 @@ static int predictor_init_arrays(Predictor *p) {
     p->sample_representative = alloc_i64(n3);
     p->double_resolution_prediction_error = alloc_i64(n3);
     p->scaled_prediction_endpoint_difference = alloc_i64(n3);
-    p->mapped_quantizer_index = alloc_i64(n3);
+    if (!p->mapped_quantizer_index) {
+        p->mapped_quantizer_index = alloc_i64(n3);
+    }
 
     if (!p->local_sum || !p->local_difference_vector || !p->weight_vector ||
         !p->predicted_central_local_difference || !p->high_resolution_predicted_sample_value ||
@@ -1302,6 +1875,107 @@ static int predictor_run(Predictor *p) {
     return 0;
 }
 
+static void predictor_compute_endpoint_differences(Predictor *p, int x, int y, int z, int t,
+                                                   int64_t *lower_diff_out, int64_t *upper_diff_out) {
+    int x_size = header_get_x_size(p->header);
+    int z_size = header_get_z_size(p->header);
+    size_t idx = idx3(y, x, z, x_size, z_size);
+
+    int64_t lower_diff = 0;
+    int64_t upper_diff = 0;
+    if (t == 0) {
+        lower_diff = p->predicted_sample_value[idx] - p->image_constants->lower_sample_limit;
+        upper_diff = p->image_constants->upper_sample_limit - p->predicted_sample_value[idx];
+    } else {
+        int64_t denom = 2 * p->maximum_error[idx] + 1;
+        lower_diff = (p->predicted_sample_value[idx] - p->image_constants->lower_sample_limit + p->maximum_error[idx]) / denom;
+        upper_diff = (p->image_constants->upper_sample_limit - p->predicted_sample_value[idx] + p->maximum_error[idx]) / denom;
+    }
+
+    *lower_diff_out = lower_diff;
+    *upper_diff_out = upper_diff;
+}
+
+static int predictor_reconstruct_sample(Predictor *p, int x, int y, int z, int t) {
+    int x_size = header_get_x_size(p->header);
+    int z_size = header_get_z_size(p->header);
+    size_t idx = idx3(y, x, z, x_size, z_size);
+    int64_t mapped = p->mapped_quantizer_index[idx];
+    int64_t lower_diff = 0;
+    int64_t upper_diff = 0;
+
+    predictor_compute_endpoint_differences(p, x, y, z, t, &lower_diff, &upper_diff);
+    p->scaled_prediction_endpoint_difference[idx] = (lower_diff < upper_diff) ? lower_diff : upper_diff;
+
+    int64_t s = p->scaled_prediction_endpoint_difference[idx];
+    int64_t q = 0;
+    int parity_sign = ((p->double_resolution_predicted_sample_value[idx] % 2) == 0) ? 1 : -1;
+
+    if (mapped > 2 * s) {
+        int64_t magnitude = mapped - s;
+        if (upper_diff > lower_diff) q = magnitude;
+        else if (lower_diff > upper_diff) q = -magnitude;
+        else return -1;
+    } else if ((mapped & 1) == 0) {
+        q = (int64_t)parity_sign * (mapped / 2);
+    } else {
+        q = -(int64_t)parity_sign * ((mapped + 1) / 2);
+    }
+
+    p->quantizer_index[idx] = q;
+
+    int64_t reconstructed = 0;
+    if (t == 0 || p->maximum_error[idx] == 0) {
+        reconstructed = p->predicted_sample_value[idx] + q;
+    } else {
+        reconstructed = p->predicted_sample_value[idx] + q * (2 * p->maximum_error[idx] + 1);
+    }
+    reconstructed = clip_i64(reconstructed, p->image_constants->lower_sample_limit, p->image_constants->upper_sample_limit);
+
+    p->prediction_residual[idx] = reconstructed - p->predicted_sample_value[idx];
+    p->clipped_quantizer_bin_center[idx] = reconstructed;
+    p->image_sample[idx] = reconstructed;
+    return 0;
+}
+
+static int predictor_inverse_run(Predictor *p) {
+    if (predictor_init_constants(p) != 0) {
+        predictor_free(p);
+        return -1;
+    }
+    if (predictor_init_arrays(p) != 0) {
+        predictor_free(p);
+        return -1;
+    }
+
+    Header *h = p->header;
+    int x = header_get_x_size(h);
+    int y = header_get_y_size(h);
+    int z = header_get_z_size(h);
+
+    for (int yi = 0; yi < y; yi++) {
+        for (int xi = 0; xi < x; xi++) {
+            int t = xi + yi * x;
+            for (int zi = 0; zi < z; zi++) {
+                predictor_calculate_local_sum(p, xi, yi, zi, t);
+                predictor_calculate_local_difference_vector(p, xi, yi, zi, t);
+                predictor_calculate_weight_vector(p, xi, yi, zi, t);
+                predictor_calculate_predicted_central_local_difference(p, xi, yi, zi, t);
+                predictor_calculate_prediction(p, xi, yi, zi, t);
+                predictor_calculate_maximum_error(p, xi, yi, zi);
+                if (predictor_reconstruct_sample(p, xi, yi, zi, t) != 0) {
+                    predictor_free(p);
+                    return -1;
+                }
+                predictor_calculate_sample_representative(p, xi, yi, zi, t);
+                predictor_calculate_prediction_error(p, xi, yi, zi);
+            }
+        }
+    }
+
+    return 0;
+}
+
 /* ---------------- Encoders ---------------- */
 
 /* Block-adaptive encoder */
@@ -1327,9 +2001,9 @@ typedef struct {
 
 static void ba_free(BlockAdaptiveEncoder *enc) {
     if (!enc) return;
-    free(enc->blocks);
+    workspace_free(enc->blocks);
     enc->blocks = NULL;
-    free(enc->zero_block_count);
+    workspace_free(enc->zero_block_count);
     enc->zero_block_count = NULL;
     bw_free(&enc->bitstream);
 }
@@ -1580,6 +2254,293 @@ static int ba_run(BlockAdaptiveEncoder *enc) {
     return 0;
 }
 
+typedef struct {
+    Header *header;
+    ImageConstants *image_constants;
+    int block_size;
+    int reference_sample_interval;
+    int id_bits;
+    int segment_size;
+    int max_sample_split_bits;
+    int periodic_error_update_values_num;
+
+    int64_t *blocks;
+    size_t blocks_count;
+} BlockAdaptiveDecoder;
+
+static void bad_free(BlockAdaptiveDecoder *dec) {
+    if (!dec) return;
+    workspace_free(dec->blocks);
+    dec->blocks = NULL;
+}
+
+static void bad_init(BlockAdaptiveDecoder *dec, Header *h, ImageConstants *ic) {
+    memset(dec, 0, sizeof(*dec));
+    dec->header = h;
+    dec->image_constants = ic;
+    dec->segment_size = 64;
+}
+
+static int bad_init_constants(BlockAdaptiveDecoder *dec) {
+    Header *h = dec->header;
+    int block_sizes[4] = {8, 16, 32, 64};
+    if (h->block_size < 0 || h->block_size > 3) return -1;
+
+    dec->block_size = block_sizes[h->block_size];
+    dec->reference_sample_interval = h->reference_sample_interval + ((h->reference_sample_interval == 0) ? (1 << 12) : 0);
+
+    int id_bits_lower = (h->restricted_code_options_flag == RESTRICTED_RESTRICTED) ? 1 : 3;
+    dec->id_bits = (int)fmax(ceil(log2((double)dec->image_constants->dynamic_range_bits)), id_bits_lower);
+
+    if (h->restricted_code_options_flag == RESTRICTED_RESTRICTED) {
+        dec->max_sample_split_bits = (dec->image_constants->dynamic_range_bits <= 2) ? -1 : 1;
+    } else {
+        if (dec->image_constants->dynamic_range_bits <= 8) dec->max_sample_split_bits = 5;
+        else if (dec->image_constants->dynamic_range_bits <= 16) dec->max_sample_split_bits = 13;
+        else dec->max_sample_split_bits = 29;
+    }
+
+    dec->periodic_error_update_values_num = 0;
+    if (h->periodic_error_updating_flag == PEU_USED) {
+        int updates = (header_get_y_size(h) + (1 << h->error_update_period_exponent) - 1) / (1 << h->error_update_period_exponent);
+        int errors_per_update = 0;
+        if (h->quantizer_fidelity_control_method != QF_ABS) {
+            errors_per_update += (h->relative_error_limit_assignment_method == ELA_BAND_INDEPENDENT) ? 1 : header_get_z_size(h);
+        }
+        if (h->quantizer_fidelity_control_method != QF_REL) {
+            errors_per_update += (h->absolute_error_limit_assignment_method == ELA_BAND_INDEPENDENT) ? 1 : header_get_z_size(h);
+        }
+        dec->periodic_error_update_values_num = updates * errors_per_update;
+    }
+
+    return 0;
+}
+
+static int bad_alloc_blocks(BlockAdaptiveDecoder *dec) {
+    Header *h = dec->header;
+    size_t values_to_decode = (size_t)header_get_x_size(h) * (size_t)header_get_y_size(h) * (size_t)header_get_z_size(h)
+                            + (size_t)dec->periodic_error_update_values_num;
+    dec->blocks_count = (values_to_decode + dec->block_size - 1) / dec->block_size;
+    dec->blocks = alloc_i64(dec->blocks_count * (size_t)dec->block_size);
+    return dec->blocks ? 0 : -1;
+}
+
+static int bad_decode_no_compression(BlockAdaptiveDecoder *dec, BitReader *br, size_t block_index) {
+    int dyn_bits = dec->image_constants->dynamic_range_bits;
+    size_t base = block_index * (size_t)dec->block_size;
+    for (int i = 0; i < dec->block_size; i++) {
+        uint64_t value = 0;
+        if (br_read_bits_u64(br, dyn_bits, &value) != 0) return -1;
+        dec->blocks[base + i] = (int64_t)value;
+    }
+    return 0;
+}
+
+static int bad_inverse_pairing(int64_t transformed, int64_t *d0_out, int64_t *d1_out) {
+    if (transformed < 0) return -1;
+
+    int64_t w = (int64_t)floor((sqrt(8.0 * (double)transformed + 1.0) - 1.0) / 2.0);
+    while (((w + 1) * (w + 2)) / 2 <= transformed) w++;
+    while ((w * (w + 1)) / 2 > transformed) w--;
+
+    int64_t t = (w * (w + 1)) / 2;
+    int64_t d1 = transformed - t;
+    int64_t d0 = w - d1;
+    if (d0 < 0 || d1 < 0) return -1;
+
+    *d0_out = d0;
+    *d1_out = d1;
+    return 0;
+}
+
+static int bad_decode_second_extension(BlockAdaptiveDecoder *dec, BitReader *br, size_t block_index) {
+    size_t base = block_index * (size_t)dec->block_size;
+    for (int i = 0; i < dec->block_size; i += 2) {
+        int64_t transformed = 0;
+        int64_t d0 = 0;
+        int64_t d1 = 0;
+        if (br_read_unary_zeroes(br, &transformed) != 0) return -1;
+        if (bad_inverse_pairing(transformed, &d0, &d1) != 0) return -1;
+        dec->blocks[base + i] = d0;
+        dec->blocks[base + i + 1] = d1;
+    }
+    return 0;
+}
+
+static int bad_decode_sample_splitting(BlockAdaptiveDecoder *dec, BitReader *br, size_t block_index, int k) {
+    size_t base = block_index * (size_t)dec->block_size;
+    int64_t highs[64];
+    if (dec->block_size > 64) return -1;
+
+    for (int i = 0; i < dec->block_size; i++) {
+        if (br_read_unary_zeroes(br, &highs[i]) != 0) {
+            fprintf(stderr, "Unary read failed in sample-splitting block %zu sample %d at bit %zu\n",
+                    block_index, i, br->bit_pos);
+            return -1;
+        }
+    }
+
+    for (int i = 0; i < dec->block_size; i++) {
+        uint64_t low = 0;
+        if (k > 0 && br_read_bits_u64(br, k, &low) != 0) {
+            fprintf(stderr, "Low-bit read failed in sample-splitting block %zu sample %d at bit %zu\n",
+                    block_index, i, br->bit_pos);
+            return -1;
+        }
+        dec->blocks[base + i] = (highs[i] << k) | (int64_t)low;
+    }
+    return 0;
+}
+
+static size_t bad_special_zero_run_count(const BlockAdaptiveDecoder *dec, size_t block_index) {
+    size_t in_reference = block_index % (size_t)dec->reference_sample_interval;
+    size_t segment_remaining = (size_t)dec->segment_size - (in_reference % (size_t)dec->segment_size);
+    size_t reference_remaining = (size_t)dec->reference_sample_interval - in_reference;
+    size_t remaining = dec->blocks_count - block_index;
+
+    size_t count = segment_remaining;
+    if (reference_remaining < count) count = reference_remaining;
+    if (remaining < count) count = remaining;
+    return count;
+}
+
+static int bad_decode_zero_run(BlockAdaptiveDecoder *dec, BitReader *br, size_t block_index, size_t *run_count_out) {
+    int64_t zeros_before_one = 0;
+    if (br_read_unary_zeroes(br, &zeros_before_one) != 0) return -1;
+
+    if (zeros_before_one <= 3) {
+        *run_count_out = (size_t)(zeros_before_one + 1);
+    } else if (zeros_before_one == 4) {
+        *run_count_out = bad_special_zero_run_count(dec, block_index);
+    } else {
+        *run_count_out = (size_t)zeros_before_one;
+    }
+
+    if (*run_count_out == 0 || block_index + *run_count_out > dec->blocks_count) return -1;
+
+    return 0;
+}
+
+static int bad_decode_blocks(BlockAdaptiveDecoder *dec, BitReader *br) {
+    if (bad_init_constants(dec) != 0) return -1;
+    if (bad_alloc_blocks(dec) != 0) return -1;
+
+    const uint64_t all_ones = (dec->id_bits >= 64) ? UINT64_MAX : ((1ULL << dec->id_bits) - 1ULL);
+
+    for (size_t block_index = 0; block_index < dec->blocks_count;) {
+        uint64_t code = 0;
+        if (br_read_bits_u64(br, dec->id_bits, &code) != 0) {
+            fprintf(stderr, "Failed reading block code at block %zu\n", block_index);
+            return -1;
+        }
+
+        if (code == all_ones) {
+            if (bad_decode_no_compression(dec, br, block_index) != 0) {
+                fprintf(stderr, "Failed no-compression block at block %zu\n", block_index);
+                return -1;
+            }
+            block_index++;
+            continue;
+        }
+
+        if (code == 0) {
+            int next_bit = 0;
+            if (br_read_bit(br, &next_bit) != 0) {
+                fprintf(stderr, "Failed reading code extension at block %zu\n", block_index);
+                return -1;
+            }
+            if (next_bit == 1) {
+                if (bad_decode_second_extension(dec, br, block_index) != 0) {
+                    fprintf(stderr, "Failed second-extension block at block %zu\n", block_index);
+                    return -1;
+                }
+                block_index++;
+                continue;
+            }
+
+            size_t zero_run = 0;
+            if (bad_decode_zero_run(dec, br, block_index, &zero_run) != 0) {
+                fprintf(stderr, "Failed zero-run at block %zu\n", block_index);
+                return -1;
+            }
+            block_index += zero_run;
+            continue;
+        }
+
+        int k = (int)code - 1;
+        if (k < 0 || k > dec->max_sample_split_bits) {
+            fprintf(stderr, "Invalid sample-splitting code %d at block %zu\n", k, block_index);
+            return -1;
+        }
+        if (bad_decode_sample_splitting(dec, br, block_index, k) != 0) {
+            fprintf(stderr, "Failed sample-splitting block at block %zu with k=%d\n", block_index, k);
+            return -1;
+        }
+        block_index++;
+    }
+
+    return 0;
+}
+
+static int bad_unpack_values(BlockAdaptiveDecoder *dec, int64_t *mapped_quantizer_index, size_t mapped_len) {
+    Header *h = dec->header;
+    int x = header_get_x_size(h);
+    int y = header_get_y_size(h);
+    int z = header_get_z_size(h);
+    size_t needed = (size_t)x * (size_t)y * (size_t)z;
+    if (!mapped_quantizer_index || mapped_len < needed) return -1;
+
+    size_t index = 0;
+    if (h->sample_encoding_order == ORDER_BI) {
+        for (int yi = 0; yi < y; yi++) {
+            if (yi % (1 << h->error_update_period_exponent) == 0 && h->periodic_error_updating_flag == PEU_USED) {
+                int period_index = yi / (1 << h->error_update_period_exponent);
+                if (h->quantizer_fidelity_control_method != QF_REL) {
+                    if (h->absolute_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
+                        int64_t value = dec->blocks[index++];
+                        for (int zi = 0; zi < z; zi++) h->periodic_absolute_error_limit_table[period_index * z + zi] = value;
+                    } else {
+                        for (int zi = 0; zi < z; zi++) h->periodic_absolute_error_limit_table[period_index * z + zi] = dec->blocks[index++];
+                    }
+                }
+                if (h->quantizer_fidelity_control_method != QF_ABS) {
+                    if (h->relative_error_limit_assignment_method == ELA_BAND_INDEPENDENT) {
+                        int64_t value = dec->blocks[index++];
+                        for (int zi = 0; zi < z; zi++) h->periodic_relative_error_limit_table[period_index * z + zi] = value;
+                    } else {
+                        for (int zi = 0; zi < z; zi++) h->periodic_relative_error_limit_table[period_index * z + zi] = dec->blocks[index++];
+                    }
+                }
+            }
+
+            for (int i = 0; i < (z + h->sub_frame_interleaving_depth - 1) / h->sub_frame_interleaving_depth; i++) {
+                for (int xi = 0; xi < x; xi++) {
+                    int z_start = i * h->sub_frame_interleaving_depth;
+                    int z_end = z_start + h->sub_frame_interleaving_depth;
+                    if (z_end > z) z_end = z;
+                    for (int zi = z_start; zi < z_end; zi++) {
+                        mapped_quantizer_index[idx3(yi, xi, zi, x, z)] = dec->blocks[index++];
+                    }
+                }
+            }
+        }
+    } else {
+        if (h->periodic_error_updating_flag == PEU_USED) {
+            fprintf(stderr, "BSQ periodic error updates are not supported.\n");
+            return -1;
+        }
+        for (int zi = 0; zi < z; zi++) {
+            for (int yi = 0; yi < y; yi++) {
+                for (int xi = 0; xi < x; xi++) {
+                    mapped_quantizer_index[idx3(yi, xi, zi, x, z)] = dec->blocks[index++];
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 static void image_constants_init(ImageConstants *ic, const Header *h) {
     ic->dynamic_range_bits = header_get_dynamic_range_bits(h);
     ic->dynamic_range = (int64_t)1 << ic->dynamic_range_bits;
@@ -1593,6 +2554,428 @@ static void image_constants_init(ImageConstants *ic, const Header *h) {
         ic->upper_sample_limit = ((int64_t)1 << (ic->dynamic_range_bits - 1)) - 1;
         ic->middle_sample_value = 0;
     }
+}
+
+typedef struct {
+    Header *h;
+    ImageConstants *ic;
+    int x;
+    int y;
+    int z;
+    int c;
+
+    int *spectral_bands_used;      /* [z] */
+    double *weight_exponent_offset;/* [z][c] */
+
+    int weight_component_resolution;
+    int weight_update_change_interval;
+    int weight_update_initial_parameter;
+    int weight_update_final_parameter;
+    int64_t weight_min;
+    int64_t weight_max;
+    int register_size;
+
+    int64_t *prev_row_sample_representative; /* [x][z] */
+    int64_t *curr_row_sample_representative; /* [x][z] */
+    int64_t *weight_state;                   /* [z][c] */
+    int64_t *prev_local_difference;          /* [z][c] */
+    int64_t *prev_prediction_error;          /* [z] */
+    int64_t *local_difference_curr;          /* [c] */
+    int64_t *local_difference_prev_z;        /* [c] */
+} PredictorStreamState;
+
+static size_t row_idx(int x, int z, int z_size) {
+    return (size_t)x * (size_t)z_size + (size_t)z;
+}
+
+static int predictor_stream_init(PredictorStreamState *s, Header *h, ImageConstants *ic) {
+    memset(s, 0, sizeof(*s));
+    s->h = h;
+    s->ic = ic;
+    s->x = header_get_x_size(h);
+    s->y = header_get_y_size(h);
+    s->z = header_get_z_size(h);
+    s->c = h->prediction_bands_num + (h->prediction_mode == PRED_FULL ? 3 : 0);
+
+    s->weight_component_resolution = h->weight_component_resolution + 4;
+    s->weight_update_change_interval = 1 << (h->weight_update_change_interval + 4);
+    s->weight_update_initial_parameter = h->weight_update_initial_parameter - 6;
+    s->weight_update_final_parameter = h->weight_update_final_parameter - 6;
+    s->weight_min = -((int64_t)1 << (s->weight_component_resolution + 2));
+    s->weight_max = ((int64_t)1 << (s->weight_component_resolution + 2)) - 1;
+    s->register_size = (h->register_size == 0) ? 64 : h->register_size;
+
+    s->spectral_bands_used = (int *)workspace_calloc((size_t)s->z, sizeof(int));
+    s->weight_exponent_offset = (double *)workspace_calloc((size_t)s->z * (size_t)(s->c > 0 ? s->c : 1), sizeof(double));
+    s->prev_row_sample_representative = alloc_i64((size_t)s->x * (size_t)s->z);
+    s->curr_row_sample_representative = alloc_i64((size_t)s->x * (size_t)s->z);
+    s->weight_state = alloc_i64((size_t)s->z * (size_t)(s->c > 0 ? s->c : 1));
+    s->prev_local_difference = alloc_i64((size_t)s->z * (size_t)(s->c > 0 ? s->c : 1));
+    s->prev_prediction_error = alloc_i64((size_t)s->z);
+    s->local_difference_curr = alloc_i64((size_t)(s->c > 0 ? s->c : 1));
+    s->local_difference_prev_z = alloc_i64((size_t)(s->c > 0 ? s->c : 1));
+
+    if (!s->spectral_bands_used || !s->weight_exponent_offset ||
+        !s->prev_row_sample_representative || !s->curr_row_sample_representative ||
+        !s->weight_state || !s->prev_local_difference || !s->prev_prediction_error ||
+        !s->local_difference_curr || !s->local_difference_prev_z) {
+        return -1;
+    }
+
+    for (int zi = 0; zi < s->z; zi++) {
+        s->spectral_bands_used[zi] = (zi < h->prediction_bands_num) ? zi : h->prediction_bands_num;
+    }
+
+    if (s->c > 0 && h->weight_exponent_offset_flag == WEO_NOT_ALL_ZERO && h->weight_exponent_offset_table) {
+        if (h->prediction_mode == PRED_FULL) {
+            for (int zi = 0; zi < s->z; zi++) {
+                for (int i = 0; i < 3; i++) {
+                    s->weight_exponent_offset[(size_t)zi * (size_t)s->c + (size_t)i] =
+                        (double)h->weight_exponent_offset_table[(size_t)zi * (size_t)(h->prediction_bands_num + 1)];
+                }
+                for (int i = 3; i < s->c; i++) {
+                    s->weight_exponent_offset[(size_t)zi * (size_t)s->c + (size_t)i] =
+                        (double)h->weight_exponent_offset_table[(size_t)zi * (size_t)(h->prediction_bands_num + 1) + (size_t)(i - 2)];
+                }
+            }
+        } else {
+            for (int zi = 0; zi < s->z; zi++) {
+                for (int i = 0; i < s->c; i++) {
+                    s->weight_exponent_offset[(size_t)zi * (size_t)s->c + (size_t)i] =
+                        (double)h->weight_exponent_offset_table[(size_t)zi * (size_t)h->prediction_bands_num + (size_t)i];
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+static void predictor_stream_get_error_limits(const PredictorStreamState *s, int yi, int zi,
+                                              int64_t *abs_out, int64_t *rel_out) {
+    Header *h = s->h;
+    int z = s->z;
+    *abs_out = -1;
+    *rel_out = -1;
+
+    if (h->periodic_error_updating_flag == PEU_NOT_USED) {
+        if (h->quantizer_fidelity_control_method != QF_REL) {
+            if (h->absolute_error_limit_assignment_method == ELA_BAND_INDEPENDENT) *abs_out = h->absolute_error_limit_value;
+            else *abs_out = h->absolute_error_limit_table[zi];
+        }
+        if (h->quantizer_fidelity_control_method != QF_ABS) {
+            if (h->relative_error_limit_assignment_method == ELA_BAND_INDEPENDENT) *rel_out = h->relative_error_limit_value;
+            else *rel_out = h->relative_error_limit_table[zi];
+        }
+        return;
+    }
+
+    {
+        int period = 1 << h->error_update_period_exponent;
+        int pi = yi / period;
+        if (h->quantizer_fidelity_control_method != QF_REL) {
+            if (h->absolute_error_limit_assignment_method == ELA_BAND_INDEPENDENT) *abs_out = h->periodic_absolute_error_limit_table[pi * z];
+            else *abs_out = h->periodic_absolute_error_limit_table[pi * z + zi];
+        }
+        if (h->quantizer_fidelity_control_method != QF_ABS) {
+            if (h->relative_error_limit_assignment_method == ELA_BAND_INDEPENDENT) *rel_out = h->periodic_relative_error_limit_table[pi * z];
+            else *rel_out = h->periodic_relative_error_limit_table[pi * z + zi];
+        }
+    }
+}
+
+static int64_t predictor_stream_local_sum(const PredictorStreamState *s, int yi, int xi, int zi, int t) {
+    Header *h = s->h;
+    if (t == 0) return 0;
+
+    const int64_t *prev = s->prev_row_sample_representative;
+    const int64_t *curr = s->curr_row_sample_representative;
+    int x_size = s->x;
+    int z_size = s->z;
+
+    if (h->local_sum_type == LS_WIDE_NEIGHBOR) {
+        if (yi > 0 && xi > 0 && xi < x_size - 1) {
+            return curr[row_idx(xi - 1, zi, z_size)] +
+                   prev[row_idx(xi - 1, zi, z_size)] +
+                   prev[row_idx(xi, zi, z_size)] +
+                   prev[row_idx(xi + 1, zi, z_size)];
+        } else if (yi == 0 && xi > 0) {
+            return curr[row_idx(xi - 1, zi, z_size)] * 4;
+        } else if (yi > 0 && xi == 0) {
+            return (prev[row_idx(xi, zi, z_size)] +
+                    prev[row_idx(xi + 1, zi, z_size)]) * 2;
+        } else if (yi > 0 && xi == x_size - 1) {
+            return curr[row_idx(xi - 1, zi, z_size)] +
+                   prev[row_idx(xi - 1, zi, z_size)] +
+                   prev[row_idx(xi, zi, z_size)] * 2;
+        }
+    } else if (h->local_sum_type == LS_NARROW_NEIGHBOR) {
+        if (yi > 0 && xi > 0 && xi < x_size - 1) {
+            return prev[row_idx(xi - 1, zi, z_size)] +
+                   prev[row_idx(xi, zi, z_size)] * 2 +
+                   prev[row_idx(xi + 1, zi, z_size)];
+        } else if (yi == 0 && xi > 0 && zi > 0) {
+            return curr[row_idx(xi - 1, zi - 1, z_size)] * 4;
+        } else if (yi > 0 && xi == 0) {
+            return (prev[row_idx(xi, zi, z_size)] +
+                    prev[row_idx(xi + 1, zi, z_size)]) * 2;
+        } else if (yi > 0 && xi == x_size - 1) {
+            return (prev[row_idx(xi - 1, zi, z_size)] +
+                    prev[row_idx(xi, zi, z_size)]) * 2;
+        } else if (yi == 0 && xi > 0 && zi == 0) {
+            return s->ic->middle_sample_value * 4;
+        }
+    } else if (h->local_sum_type == LS_WIDE_COLUMN) {
+        if (yi > 0) return prev[row_idx(xi, zi, z_size)] * 4;
+        if (yi == 0 && xi > 0) return curr[row_idx(xi - 1, zi, z_size)] * 4;
+    } else if (h->local_sum_type == LS_NARROW_COLUMN) {
+        if (yi > 0) return prev[row_idx(xi, zi, z_size)] * 4;
+        if (yi == 0 && xi > 0 && zi > 0) return curr[row_idx(xi - 1, zi - 1, z_size)] * 4;
+        if (yi == 0 && xi > 0 && zi == 0) return s->ic->middle_sample_value * 4;
+    }
+
+    return 0;
+}
+
+static int predictor_stream_process(PredictorStreamState *s, int64_t *image_sample,
+                                    int64_t *mapped_quantizer_index, int inverse) {
+    Header *h = s->h;
+    ImageConstants *ic = s->ic;
+    int x = s->x;
+    int y = s->y;
+    int z = s->z;
+    int c = s->c;
+
+    if (!image_sample || (!inverse && !mapped_quantizer_index) || (inverse && !mapped_quantizer_index)) return -1;
+
+    for (int yi = 0; yi < y; yi++) {
+        if (yi > 0) {
+            int64_t *tmp = s->prev_row_sample_representative;
+            s->prev_row_sample_representative = s->curr_row_sample_representative;
+            s->curr_row_sample_representative = tmp;
+            memset(s->curr_row_sample_representative, 0, (size_t)x * (size_t)z * sizeof(int64_t));
+        }
+
+        for (int xi = 0; xi < x; xi++) {
+            int t = xi + yi * x;
+            int64_t scaling_exponent = 0;
+            if (t > 1) {
+                int64_t base = s->weight_update_initial_parameter +
+                    floor_div_i64((int64_t)(t - x), s->weight_update_change_interval);
+                base = clip_i64(base, s->weight_update_initial_parameter, s->weight_update_final_parameter);
+                scaling_exponent = base + ic->dynamic_range_bits - s->weight_component_resolution;
+            }
+            if (c > 0) memset(s->local_difference_prev_z, 0, (size_t)c * sizeof(int64_t));
+            int64_t local_sum_prev_z = 0;
+
+            for (int zi = 0; zi < z; zi++) {
+                size_t idx = idx3(yi, xi, zi, x, z);
+                int64_t local_sum = predictor_stream_local_sum(s, yi, xi, zi, t);
+                int64_t *ld = s->local_difference_curr;
+                int64_t *wz = s->weight_state + (size_t)zi * (size_t)(c > 0 ? c : 1);
+                if (c > 0) memset(ld, 0, (size_t)c * sizeof(int64_t));
+
+                int offset = 0;
+                if (h->prediction_mode == PRED_FULL && c > 0) {
+                    if (xi > 0 && yi > 0) {
+                        ld[0] = 4 * s->prev_row_sample_representative[row_idx(xi, zi, z)] - local_sum;
+                        ld[1] = 4 * s->curr_row_sample_representative[row_idx(xi - 1, zi, z)] - local_sum;
+                        ld[2] = 4 * s->prev_row_sample_representative[row_idx(xi - 1, zi, z)] - local_sum;
+                    } else if (xi == 0 && yi > 0) {
+                        int64_t v = 4 * s->prev_row_sample_representative[row_idx(xi, zi, z)] - local_sum;
+                        ld[0] = v; ld[1] = v; ld[2] = v;
+                    }
+                    offset = 3;
+                }
+
+                if (zi > 0 && s->spectral_bands_used[zi] > 0 && c > 0) {
+                    ld[offset] = 4 * s->curr_row_sample_representative[row_idx(xi, zi - 1, z)] - local_sum_prev_z;
+                    for (int i = 1; i < s->spectral_bands_used[zi]; i++) {
+                        ld[offset + i] = s->local_difference_prev_z[offset + i - 1];
+                    }
+                }
+
+                if (t == 1 && c > 0) {
+                    if (h->weight_init_method == WEIGHT_INIT_DEFAULT) {
+                        memset(wz, 0, (size_t)c * sizeof(int64_t));
+                        int woff = (h->prediction_mode == PRED_FULL) ? 3 : 0;
+                        if (zi > 0 && s->spectral_bands_used[zi] > 0) {
+                            wz[woff] = ((int64_t)1 << s->weight_component_resolution) * 7 / 8;
+                            for (int i = 1; i < s->spectral_bands_used[zi]; i++) {
+                                wz[woff + i] = wz[woff + i - 1] / 8;
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i < c; i++) {
+                            int64_t val = h->weight_init_table[(size_t)zi * (size_t)c + (size_t)i];
+                            int shift1 = s->weight_component_resolution + 3 - h->weight_init_resolution;
+                            int shift2 = s->weight_component_resolution + 2 - h->weight_init_resolution;
+                            wz[i] = ((int64_t)1 << shift1) * val + (((int64_t)1 << shift2) - 1);
+                        }
+                    }
+                } else if (t > 1 && c > 0) {
+                    int64_t *prev_ld = s->prev_local_difference + (size_t)zi * (size_t)c;
+                    for (int i = 0; i < c; i++) {
+                        double term =
+                            (double)sign_positive_i64(s->prev_prediction_error[zi]) *
+                            (double)prev_ld[i] *
+                            pow(2.0, -(double)(scaling_exponent + s->weight_exponent_offset[(size_t)zi * (size_t)c + (size_t)i]));
+                        int64_t delta = floor_div_i64((int64_t)floor(term) + 1, 2);
+                        wz[i] = clip_i64(wz[i] + delta, s->weight_min, s->weight_max);
+                    }
+                }
+
+                int64_t predicted_center = 0;
+                if (t > 0 && !(h->prediction_mode == PRED_REDUCED && zi == 0) && c > 0) {
+                    for (int i = 0; i < c; i++) predicted_center += wz[i] * ld[i];
+                }
+
+                int64_t high_pred = 0;
+                int64_t double_pred = 0;
+                if (t > 0) {
+                    int64_t tmp = predicted_center +
+                        ((int64_t)1 << s->weight_component_resolution) * (local_sum - 4 * ic->middle_sample_value);
+                    tmp = modulo_star_i64(tmp, s->register_size);
+                    tmp += ((int64_t)1 << (s->weight_component_resolution + 2)) * ic->middle_sample_value +
+                           ((int64_t)1 << (s->weight_component_resolution + 1));
+                    {
+                        int64_t minv = ((int64_t)1 << (s->weight_component_resolution + 2)) * ic->lower_sample_limit;
+                        int64_t maxv = ((int64_t)1 << (s->weight_component_resolution + 2)) * ic->upper_sample_limit +
+                                       ((int64_t)1 << (s->weight_component_resolution + 1));
+                        high_pred = clip_i64(tmp, minv, maxv);
+                    }
+                    double_pred = high_pred >> (s->weight_component_resolution + 1);
+                } else if (h->prediction_bands_num > 0 && zi > 0) {
+                    double_pred = 2 * image_sample[idx3(yi, xi, zi - 1, x, z)];
+                } else {
+                    double_pred = 2 * ic->middle_sample_value;
+                }
+                int64_t predicted_sample = double_pred / 2;
+
+                int64_t abs_e = -1, rel_e = -1;
+                predictor_stream_get_error_limits(s, yi, zi, &abs_e, &rel_e);
+
+                int64_t max_error = 0;
+                if (h->quantizer_fidelity_control_method == QF_LOSSLESS) max_error = 0;
+                else if (h->quantizer_fidelity_control_method == QF_ABS) max_error = abs_e;
+                else if (h->quantizer_fidelity_control_method == QF_REL) {
+                    max_error = (int64_t)floor((double)rel_e * (double)predicted_sample / (double)ic->dynamic_range);
+                } else {
+                    int64_t rel_calc = (int64_t)floor((double)rel_e * (double)predicted_sample / (double)ic->dynamic_range);
+                    max_error = (abs_e < rel_calc) ? abs_e : rel_calc;
+                }
+
+                int64_t q = 0;
+                int64_t reconstructed = 0;
+                int64_t clipped_bin = 0;
+                if (!inverse) {
+                    int64_t residual = image_sample[idx] - predicted_sample;
+                    if (t == 0) q = residual;
+                    else {
+                        int64_t numerator = llabs(residual) + max_error;
+                        int64_t denom = 2 * max_error + 1;
+                        q = sign_i64(residual) * (numerator / denom);
+                    }
+                    reconstructed = image_sample[idx];
+                } else {
+                    int64_t mapped = mapped_quantizer_index[idx];
+                    int64_t lower_diff = 0;
+                    int64_t upper_diff = 0;
+                    if (t == 0) {
+                        lower_diff = predicted_sample - ic->lower_sample_limit;
+                        upper_diff = ic->upper_sample_limit - predicted_sample;
+                    } else {
+                        int64_t denom = 2 * max_error + 1;
+                        lower_diff = (predicted_sample - ic->lower_sample_limit + max_error) / denom;
+                        upper_diff = (ic->upper_sample_limit - predicted_sample + max_error) / denom;
+                    }
+                    {
+                        int64_t sdiff = (lower_diff < upper_diff) ? lower_diff : upper_diff;
+                        int parity_sign = ((double_pred % 2) == 0) ? 1 : -1;
+                        if (mapped > 2 * sdiff) {
+                            int64_t magnitude = mapped - sdiff;
+                            if (upper_diff > lower_diff) q = magnitude;
+                            else if (lower_diff > upper_diff) q = -magnitude;
+                            else return -1;
+                        } else if ((mapped & 1) == 0) {
+                            q = (int64_t)parity_sign * (mapped / 2);
+                        } else {
+                            q = -(int64_t)parity_sign * ((mapped + 1) / 2);
+                        }
+                    }
+                    if (t == 0 || max_error == 0) reconstructed = predicted_sample + q;
+                    else reconstructed = predicted_sample + q * (2 * max_error + 1);
+                    reconstructed = clip_i64(reconstructed, ic->lower_sample_limit, ic->upper_sample_limit);
+                    image_sample[idx] = reconstructed;
+                }
+
+                if (t == 0) {
+                    clipped_bin = reconstructed;
+                } else if (max_error == 0) {
+                    clipped_bin = reconstructed;
+                } else {
+                    int64_t val = predicted_sample + q * (2 * max_error + 1);
+                    clipped_bin = clip_i64(val, ic->lower_sample_limit, ic->upper_sample_limit);
+                }
+
+                int64_t sample_rep = 0;
+                int64_t double_sample_rep = 0;
+                if (t == 0) {
+                    sample_rep = reconstructed;
+                    double_sample_rep = 2 * sample_rep;
+                } else if (h->damping_table_array[zi] == 0 && h->damping_offset_table_array[zi] == 0) {
+                    double_sample_rep = 2 * clipped_bin;
+                    sample_rep = clipped_bin;
+                } else {
+                    int64_t term1 = 4 * (((int64_t)1 << h->sample_representative_resolution) - h->damping_table_array[zi]);
+                    int64_t term2 = clipped_bin * ((int64_t)1 << s->weight_component_resolution) -
+                        sign_i64(q) * max_error * h->damping_offset_table_array[zi] *
+                        ((int64_t)1 << (s->weight_component_resolution - h->sample_representative_resolution));
+                    int64_t term3 = h->damping_table_array[zi] * high_pred -
+                        h->damping_table_array[zi] * ((int64_t)1 << (s->weight_component_resolution + 1));
+                    int64_t denom = (int64_t)1 << (s->weight_component_resolution + h->sample_representative_resolution + 1);
+                    double_sample_rep = floor_div_i64(term1 * term2 + term3, denom);
+                    sample_rep = (double_sample_rep + 1) / 2;
+                }
+
+                if (!inverse) {
+                    int64_t lower_diff = 0;
+                    int64_t upper_diff = 0;
+                    int64_t sdiff = 0;
+                    int64_t mapped = 0;
+                    int64_t term = 0;
+                    if (t == 0) {
+                        lower_diff = predicted_sample - ic->lower_sample_limit;
+                        upper_diff = ic->upper_sample_limit - predicted_sample;
+                    } else {
+                        int64_t denom = 2 * max_error + 1;
+                        lower_diff = (predicted_sample - ic->lower_sample_limit + max_error) / denom;
+                        upper_diff = (ic->upper_sample_limit - predicted_sample + max_error) / denom;
+                    }
+                    sdiff = (lower_diff < upper_diff) ? lower_diff : upper_diff;
+                    term = ((double_pred % 2) == 0 ? 1 : -1) * q;
+
+                    if (llabs(q) > sdiff) mapped = llabs(q) + sdiff;
+                    else if (0 <= term && term <= sdiff) mapped = 2 * llabs(q);
+                    else mapped = 2 * llabs(q) - 1;
+                    mapped_quantizer_index[idx] = mapped;
+                }
+
+                s->curr_row_sample_representative[row_idx(xi, zi, z)] = sample_rep;
+                if (c > 0) {
+                    memcpy(s->prev_local_difference + (size_t)zi * (size_t)c, ld, (size_t)c * sizeof(int64_t));
+                    memcpy(s->local_difference_prev_z, ld, (size_t)c * sizeof(int64_t));
+                }
+                if (t > 0) {
+                    s->prev_prediction_error[zi] = 2 * clipped_bin - double_pred;
+                }
+                local_sum_prev_z = local_sum;
+                (void)double_sample_rep;
+            }
+        }
+    }
+
+    return 0;
 }
 
 static int header_config_from_dims(Header *h, int x, int y, int z, const char *dtype) {
@@ -1658,6 +3041,174 @@ static int write_bitstream_with_header(const char *out_dir, const char *out_file
     return rc;
 }
 
+static int load_file_bytes(const char *path, uint8_t **data_out, size_t *len_out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    uint8_t *data = NULL;
+    if (size > 0) {
+        data = (uint8_t *)workspace_alloc((size_t)size);
+        if (!data) {
+            fclose(f);
+            return -1;
+        }
+        if (fread(data, 1, (size_t)size, f) != (size_t)size) {
+            workspace_free(data);
+            fclose(f);
+            return -1;
+        }
+    }
+
+    fclose(f);
+    *data_out = data;
+    *len_out = (size_t)size;
+    return 0;
+}
+
+static int header_infer_output_dtype(const Header *h, char *dtype_out, size_t dtype_len) {
+    const char *prefix = (h->sample_type == SAMPLE_UNSIGNED) ? "u" : "s";
+    int bits = header_get_dynamic_range_bits(h);
+    int storage_bits = 0;
+
+    if (bits <= 8) storage_bits = 8;
+    else if (bits <= 16) storage_bits = 16;
+    else if (bits <= 32) storage_bits = 32;
+    else if (bits <= 64) storage_bits = 64;
+    else return -1;
+
+    int written = snprintf(dtype_out, dtype_len, "%s%dbe", prefix, storage_bits);
+    return (written < 0 || (size_t)written >= dtype_len) ? -1 : 0;
+}
+
+static int decompress_one_image(const char *bitstream_path, const char *output_root,
+                                const uint8_t *bitstream_buf, size_t bitstream_len) {
+    Header h;
+    header_init_defaults(&h);
+
+    int result = -1;
+    uint8_t *owned_bitstream_buf = NULL;
+    const uint8_t *bitstream_data = bitstream_buf;
+    int64_t *image_sample = NULL;
+    int64_t *mapped_quantizer_index = NULL;
+    Predictor pred;
+    int pred_ready = 0;
+    size_t sample_count = 0;
+
+    if (!bitstream_data) {
+        if (load_file_bytes(bitstream_path, &owned_bitstream_buf, &bitstream_len) != 0) {
+            fprintf(stderr, "Failed reading bitstream: %s\n", bitstream_path);
+            goto cleanup;
+        }
+        bitstream_data = owned_bitstream_buf;
+    }
+
+    if (!bitstream_data || bitstream_len == 0) {
+        fprintf(stderr, "Bitstream is empty: %s\n", bitstream_path);
+        goto cleanup;
+    }
+
+    BitReader br;
+    br_init(&br, bitstream_data, bitstream_len);
+    if (header_parse_from_bitstream(&h, &br) != 0) {
+        fprintf(stderr, "Failed parsing CCSDS123 header: %s\n", bitstream_path);
+        goto cleanup;
+    }
+
+    ImageConstants ic;
+    image_constants_init(&ic, &h);
+
+    int x = header_get_x_size(&h);
+    int y = header_get_y_size(&h);
+    int z = header_get_z_size(&h);
+    sample_count = (size_t)x * (size_t)y * (size_t)z;
+
+    image_sample = (int64_t *)workspace_alloc(sizeof(int64_t) * sample_count);
+    mapped_quantizer_index = alloc_i64(sample_count);
+    if (!image_sample || !mapped_quantizer_index) goto cleanup;
+    memset(image_sample, 0, sizeof(int64_t) * sample_count);
+
+    {
+        BlockAdaptiveDecoder dec;
+        bad_init(&dec, &h, &ic);
+        if (bad_decode_blocks(&dec, &br) != 0) {
+            fprintf(stderr, "Block-adaptive decoder failed for %s\n", bitstream_path);
+            bad_free(&dec);
+            goto cleanup;
+        }
+        if (bad_unpack_values(&dec, mapped_quantizer_index, sample_count) != 0) {
+            fprintf(stderr, "Failed unpacking decoded values for %s\n", bitstream_path);
+            bad_free(&dec);
+            goto cleanup;
+        }
+        bad_free(&dec);
+    }
+
+    if (g_workspace.enabled) {
+        PredictorStreamState ps;
+        if (predictor_stream_init(&ps, &h, &ic) != 0 ||
+            predictor_stream_process(&ps, image_sample, mapped_quantizer_index, 1) != 0) {
+            fprintf(stderr, "Inverse predictor (streaming) failed for %s\n", bitstream_path);
+            goto cleanup;
+        }
+    } else {
+        predictor_init(&pred, &h, &ic, image_sample);
+        pred.mapped_quantizer_index = mapped_quantizer_index;
+        mapped_quantizer_index = NULL; /* ownership transferred to Predictor */
+        if (predictor_inverse_run(&pred) != 0) {
+            fprintf(stderr, "Inverse predictor failed for %s\n", bitstream_path);
+            goto cleanup;
+        }
+        pred_ready = 1;
+    }
+
+    char dtype[16] = {0};
+    if (header_infer_output_dtype(&h, dtype, sizeof(dtype)) != 0) {
+        fprintf(stderr, "Failed inferring output dtype for %s\n", bitstream_path);
+        goto cleanup;
+    }
+
+    char out_dir[MAX_PATH_LEN];
+    if (make_output_folder(output_root, bitstream_path, 0, out_dir) != 0) goto cleanup;
+
+    char out_file_name[MAX_PATH_LEN];
+    if (build_decompressed_filename(bitstream_path, dtype, z, y, x, out_file_name, sizeof(out_file_name)) != 0) {
+        fprintf(stderr, "Output file name too long: %s\n", bitstream_path);
+        goto cleanup;
+    }
+
+    char out_path[MAX_PATH_LEN];
+    if (build_out_path(out_dir, out_file_name, out_path, sizeof(out_path)) != 0) goto cleanup;
+
+    if (write_raw_bsq(out_path, dtype, z, y, x, image_sample, sample_count) != 0) {
+        fprintf(stderr, "Failed writing decompressed image: %s\n", out_path);
+        goto cleanup;
+    }
+
+    result = 0;
+
+cleanup:
+    if (pred_ready) predictor_free(&pred);
+    workspace_free(mapped_quantizer_index);
+    workspace_free(image_sample);
+    workspace_free(owned_bitstream_buf);
+    header_free(&h);
+    return result;
+}
+
 static int compress_one_image(const char *raw_path, const char *output_root, int ael,
                               int override_x, int override_y, int override_z, const char *override_dtype,
                               int64_t *image_sample_buf, size_t image_sample_len) {
@@ -1668,6 +3219,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
     int owns_image_sample = 0;
     Predictor pred;
     int pred_ready = 0;
+    size_t image_sample_count = 0;
     char dtype[16] = {0};
     int z = 0, y = 0, x = 0;
     int parsed = (parse_raw_filename(raw_path, dtype, &z, &y, &x) == 0);
@@ -1713,9 +3265,9 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
 
     /* load image */
     /* dtype/x/y/z already resolved above */
-    size_t image_sample_count = (size_t)x * (size_t)y * (size_t)z;
+    image_sample_count = (size_t)x * (size_t)y * (size_t)z;
     if (!image_sample) {
-        image_sample = (int64_t *)malloc(sizeof(int64_t) * image_sample_count);
+        image_sample = (int64_t *)workspace_alloc(sizeof(int64_t) * image_sample_count);
         if (!image_sample) goto cleanup;
         owns_image_sample = 1;
     } else if (image_sample_len < image_sample_count) {
@@ -1729,7 +3281,16 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
     image_constants_init(&ic, &h);
 
     predictor_init(&pred, &h, &ic, image_sample);
-    if (predictor_run(&pred) != 0) {
+    if (g_workspace.enabled) {
+        PredictorStreamState ps;
+        pred.mapped_quantizer_index = alloc_i64(image_sample_count);
+        if (!pred.mapped_quantizer_index ||
+            predictor_stream_init(&ps, &h, &ic) != 0 ||
+            predictor_stream_process(&ps, image_sample, pred.mapped_quantizer_index, 0) != 0) {
+            fprintf(stderr, "Predictor (streaming) failed for %s\n", raw_path);
+            goto cleanup;
+        }
+    } else if (predictor_run(&pred) != 0) {
         fprintf(stderr, "Predictor failed for %s\n", raw_path);
         goto cleanup;
     }
@@ -1755,7 +3316,7 @@ static int compress_one_image(const char *raw_path, const char *output_root, int
 
 cleanup:
     if (pred_ready) predictor_free(&pred);
-    if (owns_image_sample) free(image_sample);
+    if (owns_image_sample) workspace_free(image_sample);
     header_free(&h);
     return result;
 }
@@ -1779,8 +3340,25 @@ int ccsds123_compress_one_image(const char *raw_path, const char *output_root, i
 int ccsds123_compress_with_buffer(const char *raw_path, const char *output_root, int ael,
                                             int override_x, int override_y, int override_z, const char *override_dtype,
                                             int64_t *image_sample_buf, size_t image_sample_len) {
-    return compress_one_image(raw_path, output_root, ael, override_x, override_y, override_z, override_dtype,
-                              image_sample_buf, image_sample_len);
+    int rc = -1;
+    if (image_sample_buf) workspace_begin_no_heap();
+    rc = compress_one_image(raw_path, output_root, ael, override_x, override_y, override_z, override_dtype,
+                            image_sample_buf, image_sample_len);
+    if (image_sample_buf) workspace_end_no_heap();
+    return rc;
+}
+
+int ccsds123_decompress_one_image(const char *bitstream_path, const char *output_root) {
+    return decompress_one_image(bitstream_path, output_root, NULL, 0);
+}
+
+int ccsds123_decompress_with_buffer(const char *bitstream_path, const char *output_root,
+                                    const uint8_t *bitstream_buf, size_t bitstream_len) {
+    int rc = -1;
+    if (bitstream_buf) workspace_begin_no_heap();
+    rc = decompress_one_image(bitstream_path, output_root, bitstream_buf, bitstream_len);
+    if (bitstream_buf) workspace_end_no_heap();
+    return rc;
 }
 
 int ccsds123_ends_with_raw(const char *name) {
